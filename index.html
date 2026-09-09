@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XDTO Diff — сравнение и объединение пакетов</title>
+<style>
+  :root{
+    --bg: #0e1015;
+    --panel: #161922;
+    --panel-2: #1c202b;
+    --border: #262b38;
+    --text: #e7e9ee;
+    --muted: #8891a3;
+    --muted-2: #5b6478;
+    --accent: #4fd1c5;
+    --accent-dim: #2b6b66;
+    --add: #34d399;
+    --add-bg: rgba(52,211,153,0.09);
+    --rm: #f87171;
+    --rm-bg: rgba(248,113,113,0.09);
+    --chg: #fbbf24;
+    --chg-bg: rgba(251,191,36,0.09);
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  *{ box-sizing: border-box; }
+  html,body{ margin:0; padding:0; }
+  body{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.5;
+    padding: 28px 20px 80px;
+  }
+  .wrap{ max-width: 1000px; margin: 0 auto; }
+
+  header{ margin-bottom: 28px; }
+  header .kicker{
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--accent);
+    letter-spacing: 0.02em;
+    margin: 0 0 6px;
+  }
+  header h1{
+    font-size: 22px;
+    font-weight: 650;
+    margin: 0 0 8px;
+    letter-spacing: -0.01em;
+  }
+  header p{
+    color: var(--muted);
+    font-size: 14px;
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .drop-row{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin: 22px 0 16px;
+  }
+  @media (max-width: 640px){ .drop-row{ grid-template-columns: 1fr; } }
+
+  .dropzone{
+    background: var(--panel);
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    cursor: pointer;
+    transition: border-color .15s ease, background .15s ease;
+    user-select: none;
+  }
+  .dropzone:hover{ border-color: var(--muted-2); }
+  .dropzone.drag{ border-color: var(--accent); background: var(--panel-2); }
+  .dropzone.loaded{ border-style: solid; border-color: var(--accent-dim); }
+  .dz-label{
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    margin: 0 0 8px;
+  }
+  .dz-file{
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: var(--text);
+    word-break: break-all;
+  }
+  .dz-file.empty{ color: var(--muted-2); }
+  .dz-meta{ font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .actions-row{ display:flex; align-items:center; gap: 10px; margin: 4px 0 26px; flex-wrap: wrap; }
+  button{
+    font-family: var(--sans);
+    font-size: 13.5px;
+    font-weight: 600;
+    border-radius: 7px;
+    border: 1px solid transparent;
+    padding: 9px 16px;
+    cursor: pointer;
+    transition: opacity .12s ease, transform .05s ease;
+  }
+  button:active{ transform: translateY(1px); }
+  button:disabled{ opacity: 0.35; cursor: not-allowed; }
+  .btn-primary{ background: var(--accent); color: #06211f; }
+  .btn-primary:hover:not(:disabled){ opacity: 0.88; }
+  .btn-secondary{ background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .btn-secondary:hover:not(:disabled){ border-color: var(--muted-2); }
+  .btn-ghost{ background: transparent; color: var(--muted); border-color: var(--border); font-weight: 500; }
+  .btn-ghost:hover:not(:disabled){ color: var(--text); }
+
+  .error-box{
+    background: var(--rm-bg);
+    border: 1px solid rgba(248,113,113,0.35);
+    color: #ffb4b4;
+    padding: 12px 14px;
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    margin-bottom: 18px;
+    white-space: pre-wrap;
+  }
+
+  .stats{
+    display:flex; gap: 18px; flex-wrap: wrap;
+    padding: 14px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .stat{ display:flex; align-items:center; gap:7px; }
+  .dot{ width:8px; height:8px; border-radius: 50%; display:inline-block; }
+  .dot.add{ background: var(--add); }
+  .dot.rm{ background: var(--rm); }
+  .dot.chg{ background: var(--chg); }
+  .dot.same{ background: var(--muted-2); }
+  .stat b{ color: var(--text); font-weight: 600; }
+  .stat span{ color: var(--muted); }
+
+  .controls{
+    display:flex; gap: 10px; align-items:center; margin-bottom: 10px; flex-wrap: wrap;
+  }
+  .search{
+    flex: 1; min-width: 200px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 8px 12px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .search:focus{ outline: none; border-color: var(--accent-dim); }
+  .toggle-label{
+    display:flex; align-items:center; gap: 7px;
+    font-size: 13px; color: var(--muted);
+    user-select: none; cursor: pointer;
+    white-space: nowrap;
+  }
+  .toggle-label input{ accent-color: var(--accent); }
+
+  .global-strategy{
+    display:flex; align-items:center; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 18px;
+    font-size: 12.5px; color: var(--muted);
+  }
+  .quick-btn{
+    font-family: var(--mono); font-size: 11.5px;
+    padding: 5px 11px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--panel-2);
+    color: var(--muted); cursor: pointer;
+  }
+  .quick-btn:hover{ color: var(--text); border-color: var(--muted-2); }
+
+  .section-title{
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted-2);
+    margin: 22px 0 8px;
+    padding-top: 4px;
+    border-top: 1px solid var(--border);
+  }
+
+  .type-row{
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 6px;
+    overflow: hidden;
+  }
+  .type-row.excluded{ opacity: 0.55; }
+  .type-head{
+    display:flex; align-items:center; gap: 10px;
+    padding: 10px 12px;
+    cursor: pointer;
+  }
+  .type-head:hover{ background: var(--panel-2); }
+  .type-chk{ accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
+  .caret{
+    color: var(--muted-2);
+    font-size: 10px;
+    width: 10px;
+    transition: transform .12s ease;
+    flex-shrink:0;
+  }
+  .caret.open{ transform: rotate(90deg); }
+  .type-name{
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: var(--text);
+    flex: 1;
+    word-break: break-all;
+  }
+  .badge{
+    font-family: var(--mono);
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .badge.add{ background: var(--add-bg); color: var(--add); }
+  .badge.rm{ background: var(--rm-bg); color: var(--rm); }
+  .badge.chg{ background: var(--chg-bg); color: var(--chg); }
+  .badge.same{ background: rgba(139,145,163,0.1); color: var(--muted); }
+  .kind-badge{
+    font-family: var(--mono); font-size: 10px; color: var(--muted-2);
+    border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; flex-shrink:0;
+  }
+
+  .type-body{
+    border-top: 1px solid var(--border);
+    padding: 10px 12px 12px 12px;
+    display: none;
+  }
+  .type-body.open{ display: block; }
+
+  .base-line{
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    margin-bottom: 8px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  .base-line .val-a{ color: var(--rm); }
+  .base-line .val-b{ color: var(--add); }
+
+  .quick-row{
+    display:flex; align-items:center; gap:6px; margin-bottom:10px;
+    font-family: var(--mono); font-size: 11px; color: var(--muted-2);
+  }
+
+  table.prop-table{ width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+  table.prop-table th{
+    text-align: left; color: var(--muted-2); font-weight: 500;
+    padding: 4px 8px; border-bottom: 1px solid var(--border); font-size: 11px;
+  }
+  table.prop-table td{ padding: 5px 8px; border-bottom: 1px solid rgba(38,43,56,0.5); vertical-align: top; }
+  tr.prop-add td:nth-child(2){ border-left: 2px solid var(--add); }
+  tr.prop-rm td:nth-child(2){ border-left: 2px solid var(--rm); }
+  tr.prop-chg td:nth-child(2){ border-left: 2px solid var(--chg); }
+  tr.prop-same td:nth-child(2){ border-left: 2px solid transparent; }
+  tr.prop-excluded{ opacity: 0.4; }
+  .chk-cell{ width: 22px; }
+  .chk-cell input{ accent-color: var(--accent); cursor:pointer; }
+  .prop-name{ color: var(--text); }
+  .prop-add .prop-name{ color: var(--add); }
+  .prop-rm .prop-name{ color: var(--rm); }
+  .val-diff-a{ color: var(--rm); display:block; }
+  .val-diff-b{ color: var(--add); display:block; }
+
+  .side-pills{ display:flex; gap:4px; }
+  .side-pill{
+    font-family: var(--mono); font-size:10.5px; padding:2px 8px; border-radius:4px;
+    border:1px solid var(--border); background:var(--panel-2); color:var(--muted); cursor:pointer;
+  }
+  .side-pill:hover{ border-color: var(--muted-2); }
+  .side-pill.active{ background: var(--accent); color:#06211f; border-color:var(--accent); }
+
+  .empty-state{
+    text-align:center; color: var(--muted-2); font-size: 13px;
+    padding: 30px 10px; font-family: var(--mono);
+  }
+
+  .merge-panel{
+    margin-top: 30px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+  }
+  .merge-panel h2{ font-size: 15px; margin: 0 0 6px; }
+  .merge-panel p{ font-size: 13px; color: var(--muted); margin: 0 0 14px; max-width: 65ch; }
+  .merge-summary{
+    font-family: var(--mono); font-size: 12.5px; color: var(--muted);
+    margin: 0 0 14px;
+  }
+  .merge-summary b{ color: var(--text); }
+  textarea.xml-preview{
+    width: 100%; height: 260px;
+    background: #0a0c11;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: #c9d1e0;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 12px;
+    resize: vertical;
+    display: none;
+  }
+  textarea.xml-preview.open{ display: block; margin-top: 12px; }
+
+  .note{
+    font-size: 12px; color: var(--muted-2); margin-top: 10px; max-width: 65ch;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <p class="kicker">XDTO · сравнение и объединение пакетов 1С</p>
+    <h1>XDTO Diff</h1>
+    <p>Загрузите два файла пакета XDTO из выгрузки конфигурации (<code>XDTOPackages/&lt;Имя&gt;/Ext/Package.bin</code>). Инструмент сопоставит типы по имени и пространству имён (не по автогенерируемому префиксу), покажет отличия по каждому свойству и соберёт итоговый <code>Package.bin</code> — вы решаете чекбоксом, что попадёт в результат.</p>
+  </header>
+
+  <div class="drop-row">
+    <div class="dropzone" id="dz-a">
+      <p class="dz-label">Файл A</p>
+      <p class="dz-file empty" id="dz-a-name">перетащите файл или нажмите, чтобы выбрать</p>
+      <p class="dz-meta" id="dz-a-meta"></p>
+    </div>
+    <div class="dropzone" id="dz-b">
+      <p class="dz-label">Файл B</p>
+      <p class="dz-file empty" id="dz-b-name">перетащите файл или нажмите, чтобы выбрать</p>
+      <p class="dz-meta" id="dz-b-meta"></p>
+    </div>
+  </div>
+  <input type="file" id="file-a" style="display:none" />
+  <input type="file" id="file-b" style="display:none" />
+
+  <div class="actions-row">
+    <button class="btn-primary" id="compare-btn" disabled>Сравнить</button>
+    <button class="btn-ghost" id="reset-btn">Сбросить</button>
+  </div>
+
+  <div id="error-slot"></div>
+  <div id="results"></div>
+
+</div>
+
+<script>
+(function(){
+
+  // ---------- state ----------
+  const state = {
+    fileA: null, fileB: null,
+    pkgA: null, pkgB: null,
+    diffTypes: null,
+    diffValueTypes: null,
+    typeInclude: {},   // key: kind::name -> bool, default true
+    propInclude: {},   // key: kind::name::propName -> bool, default true
+    propSide: {},      // key: kind::name::propName -> 'A'|'B', default 'A'
+    baseSide: {},      // key: kind::name -> 'A'|'B', default 'A'
+    openRows: {},
+    filterText: '',
+    diffOnly: false,
+  };
+
+  // ---------- dropzone wiring (no <label>, so no double-trigger from native forwarding) ----------
+  function wireDropzone(zoneId, inputId, nameId, metaId, slot){
+    const zone = document.getElementById(zoneId);
+    const input = document.getElementById(inputId);
+
+    zone.addEventListener('click', ()=>{ input.value = ''; input.click(); });
+
+    input.addEventListener('change', (e)=>{
+      if (e.target.files && e.target.files[0]) loadFile(e.target.files[0], slot, zone, nameId, metaId);
+    });
+    ['dragenter','dragover'].forEach(ev=>{
+      zone.addEventListener(ev, (e)=>{ e.preventDefault(); e.stopPropagation(); zone.classList.add('drag'); });
+    });
+    ['dragleave','drop'].forEach(ev=>{
+      zone.addEventListener(ev, (e)=>{ e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag'); });
+    });
+    zone.addEventListener('drop', (e)=>{
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) loadFile(f, slot, zone, nameId, metaId);
+    });
+  }
+
+  function stripBOM(text){
+    if (text.charCodeAt(0) === 0xFEFF) return text.slice(1);
+    return text;
+  }
+
+  function loadFile(file, slot, zone, nameId, metaId){
+    const reader = new FileReader();
+    reader.onload = function(){
+      const text = stripBOM(String(reader.result));
+      const rec = { name: file.name, size: file.size, text };
+      if (slot === 'A') state.fileA = rec; else state.fileB = rec;
+      document.getElementById(nameId).textContent = file.name;
+      document.getElementById(nameId).classList.remove('empty');
+      document.getElementById(metaId).textContent = (file.size/1024).toFixed(1) + ' КБ';
+      zone.classList.add('loaded');
+      updateCompareEnabled();
+    };
+    reader.onerror = function(){
+      showError('Не удалось прочитать файл ' + file.name + '. Попробуйте выбрать его ещё раз.');
+    };
+    reader.readAsText(file, 'utf-8');
+  }
+
+  function updateCompareEnabled(){
+    document.getElementById('compare-btn').disabled = !(state.fileA && state.fileB);
+  }
+
+  wireDropzone('dz-a','file-a','dz-a-name','dz-a-meta','A');
+  wireDropzone('dz-b','file-b','dz-b-name','dz-b-meta','B');
+
+  document.getElementById('reset-btn').addEventListener('click', ()=>{ location.reload(); });
+
+  // ---------- error display ----------
+  function showError(msg){
+    document.getElementById('error-slot').innerHTML = '<div class="error-box">' + escapeHtml(msg) + '</div>';
+  }
+  function clearError(){ document.getElementById('error-slot').innerHTML = ''; }
+
+  // ---------- XML parsing ----------
+  function resolvePrefix(el, prefix){
+    let node = el;
+    while (node && node.nodeType === 1){
+      const attrName = prefix ? ('xmlns:' + prefix) : 'xmlns';
+      if (node.hasAttribute && node.hasAttribute(attrName)) return node.getAttribute(attrName);
+      node = node.parentElement;
+    }
+    if (prefix === 'xs') return 'http://www.w3.org/2001/XMLSchema';
+    return null;
+  }
+
+  function resolveQName(el, qname){
+    if (!qname) return null;
+    const idx = qname.indexOf(':');
+    if (idx === -1){
+      const uri = resolvePrefix(el, null);
+      return { uri: uri || '', local: qname, raw: qname };
+    }
+    const prefix = qname.slice(0, idx);
+    const local = qname.slice(idx+1);
+    const uri = resolvePrefix(el, prefix);
+    return { uri: uri || ('unresolved:'+prefix), local, raw: qname };
+  }
+
+  function typeKey(t){ if (!t) return ''; return t.uri + '#' + t.local; }
+  function typeLabel(t){ if (!t) return '—'; return t.raw; }
+
+  // Префиксы в файлах автогенерируемые, поэтому две разные ссылки могут выглядеть одинаково.
+  // В таком случае показываем пространство имён, иначе отличие не видно.
+  function typeLabelVs(t, other){
+    if (!t) return '—';
+    if (other && t.raw === other.raw && t.uri !== other.uri) return t.raw + ' {' + t.uri + '}';
+    return t.raw;
+  }
+
+  // Все атрибуты элемента в исходном порядке, кроме объявлений пространств имён:
+  // они пересобираются при генерации, остальные (form, nillable и прочие) переносятся как есть.
+  function ownAttrs(el){
+    return Array.from(el.attributes)
+      .filter(a=> a.name !== 'xmlns' && a.name.indexOf('xmlns:') !== 0)
+      .map(a=>({ name: a.name, value: a.value }));
+  }
+
+  // Незнакомые дочерние элементы сохраняются в исходном виде, чтобы ничего не потерять.
+  function extraChildren(el, knownLocalName){
+    const ser = new XMLSerializer();
+    return Array.from(el.children)
+      .filter(c=> c.localName !== knownLocalName)
+      .map(c=> ser.serializeToString(c));
+  }
+
+  function parsePackage(xmlText, label){
+    const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+    const err = doc.querySelector('parsererror');
+    if (err){
+      throw new Error('Ошибка разбора XML (' + label + '): ' + err.textContent.trim().slice(0,400));
+    }
+    const root = doc.documentElement;
+    if (!root || root.localName !== 'package'){
+      throw new Error('Файл ' + label + ' не похож на пакет XDTO: ожидался корневой элемент <package>, найден <' + (root ? root.localName : '?') + '>');
+    }
+    const pkg = {
+      targetNamespace: root.getAttribute('targetNamespace') || '',
+      rootAttrs: Array.from(root.attributes).map(a=>({ name: a.name, value: a.value })),
+      imports: [], valueTypes: [], objectTypes: []
+    };
+    for (const child of Array.from(root.children)){
+      if (child.localName === 'import'){
+        const ns = child.getAttribute('namespace');
+        if (ns && pkg.imports.indexOf(ns) === -1) pkg.imports.push(ns);
+      } else if (child.localName === 'valueType'){
+        const name = child.getAttribute('name');
+        const baseRaw = child.getAttribute('base');
+        const base = baseRaw ? resolveQName(child, baseRaw) : null;
+        pkg.valueTypes.push({ name, base, attrs: ownAttrs(child), extraNodes: extraChildren(child, null), key: name });
+      } else if (child.localName === 'objectType'){
+        const name = child.getAttribute('name');
+        const baseRaw = child.getAttribute('base');
+        const base = baseRaw ? resolveQName(child, baseRaw) : null;
+        const open = child.getAttribute('open');
+        const sequenced = child.getAttribute('sequenced');
+        const properties = [];
+        for (const p of Array.from(child.children)){
+          if (p.localName !== 'property') continue;
+          const pname = p.getAttribute('name');
+          const typeRaw = p.getAttribute('type');
+          const type = typeRaw ? resolveQName(p, typeRaw) : null;
+          properties.push({
+            name: pname, type,
+            lowerBound: p.getAttribute('lowerBound'), upperBound: p.getAttribute('upperBound'),
+            attrs: ownAttrs(p)
+          });
+        }
+        pkg.objectTypes.push({
+          name, base, open, sequenced, properties,
+          attrs: ownAttrs(child), extraNodes: extraChildren(child, 'property'), key: name
+        });
+      }
+    }
+    return pkg;
+  }
+
+  // ---------- diff engine ----------
+  function propSignature(p){ return [typeKey(p.type), p.lowerBound||'', p.upperBound||''].join('|'); }
+
+  function diffProperties(propsA, propsB){
+    const mapA = new Map(propsA.map(p=>[p.name, p]));
+    const mapB = new Map(propsB.map(p=>[p.name, p]));
+    const names = Array.from(new Set([...mapA.keys(), ...mapB.keys()])).sort((x,y)=>x.localeCompare(y));
+    return names.map(name=>{
+      const a = mapA.get(name), b = mapB.get(name);
+      let status;
+      if (a && !b) status = 'rm';
+      else if (!a && b) status = 'add';
+      else if (propSignature(a) !== propSignature(b)) status = 'chg';
+      else status = 'same';
+      return { name, a, b, status };
+    });
+  }
+
+  function diffObjectTypes(listA, listB){
+    const mapA = new Map(listA.map(t=>[t.key, t]));
+    const mapB = new Map(listB.map(t=>[t.key, t]));
+    const names = Array.from(new Set([...mapA.keys(), ...mapB.keys()])).sort((x,y)=>x.localeCompare(y));
+    return names.map(name=>{
+      const a = mapA.get(name), b = mapB.get(name);
+      let status, props = [];
+      if (a && !b){ status = 'rm'; props = diffProperties(a.properties, []); }
+      else if (!a && b){ status = 'add'; props = diffProperties([], b.properties); }
+      else {
+        props = diffProperties(a.properties, b.properties);
+        const baseChanged = typeKey(a.base) !== typeKey(b.base) || (a.open||'')!==(b.open||'') || (a.sequenced||'')!==(b.sequenced||'');
+        const propsChanged = props.some(p=>p.status !== 'same');
+        status = (baseChanged || propsChanged) ? 'chg' : 'same';
+      }
+      return { kind:'objectType', name, a, b, status, props };
+    });
+  }
+
+  function diffValueTypes(listA, listB){
+    const mapA = new Map(listA.map(t=>[t.key, t]));
+    const mapB = new Map(listB.map(t=>[t.key, t]));
+    const names = Array.from(new Set([...mapA.keys(), ...mapB.keys()])).sort((x,y)=>x.localeCompare(y));
+    return names.map(name=>{
+      const a = mapA.get(name), b = mapB.get(name);
+      let status;
+      if (a && !b) status = 'rm';
+      else if (!a && b) status = 'add';
+      else status = (typeKey(a.base) !== typeKey(b.base)) ? 'chg' : 'same';
+      return { kind:'valueType', name, a, b, status, props: [] };
+    });
+  }
+
+  // ---------- compare action ----------
+  document.getElementById('compare-btn').addEventListener('click', ()=>{
+    clearError();
+    try{
+      state.pkgA = parsePackage(state.fileA.text, state.fileA.name);
+      state.pkgB = parsePackage(state.fileB.text, state.fileB.name);
+    } catch(e){
+      showError(e.message);
+      document.getElementById('results').innerHTML = '';
+      return;
+    }
+    state.diffTypes = diffObjectTypes(state.pkgA.objectTypes, state.pkgB.objectTypes);
+    state.diffValueTypes = diffValueTypes(state.pkgA.valueTypes, state.pkgB.valueTypes);
+    state.typeInclude = {};
+    state.propInclude = {};
+    state.propSide = {};
+    state.baseSide = {};
+    state.openRows = {};
+    renderResults();
+  });
+
+  // ---------- state helpers ----------
+  function typeKeyStr(t){ return t.kind + '::' + t.name; }
+  function propKeyStr(tk, propName){ return tk + '::' + propName; }
+  function getTypeInclude(tk){ return state.typeInclude[tk] !== false; }
+  function getPropInclude(pk){ return state.propInclude[pk] !== false; }
+  function getPropSide(pk){ return state.propSide[pk] || 'A'; }
+  function getBaseSide(tk){ return state.baseSide[tk] || 'A'; }
+
+  // ---------- rendering ----------
+  function escapeHtml(s){
+    return String(s==null?'':s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;');
+  }
+
+  function badge(status){
+    const map = { add:['add','только в B'], rm:['rm','только в A'], chg:['chg','изменён'], same:['same','совпадает'] };
+    const [cls,label] = map[status];
+    return '<span class="badge '+cls+'">'+label+'</span>';
+  }
+
+  function countBy(arr){
+    const c = { add:0, rm:0, chg:0, same:0 };
+    arr.forEach(t=>{ c[t.status]++; });
+    return c;
+  }
+
+  function renderResults(){
+    const all = [...state.diffValueTypes, ...state.diffTypes];
+    const counts = countBy(all);
+
+    let html = '';
+    html += '<div class="stats">';
+    html += '<div class="stat"><span class="dot rm"></span><b>'+counts.rm+'</b><span>только в A</span></div>';
+    html += '<div class="stat"><span class="dot add"></span><b>'+counts.add+'</b><span>только в B</span></div>';
+    html += '<div class="stat"><span class="dot chg"></span><b>'+counts.chg+'</b><span>изменено</span></div>';
+    html += '<div class="stat"><span class="dot same"></span><b>'+counts.same+'</b><span>совпадает</span></div>';
+    html += '</div>';
+
+    html += '<div class="controls">';
+    html += '<input class="search" id="search-box" placeholder="Фильтр по имени типа или свойства…" value="'+escapeHtml(state.filterText)+'">';
+    html += '<label class="toggle-label"><input type="checkbox" id="diff-only-chk" '+(state.diffOnly?'checked':'')+'> только отличия</label>';
+    html += '</div>';
+
+    html += '<div class="global-strategy">';
+    html += '<span>Для всех типов и свойств сразу:</span>';
+    html += '<button class="quick-btn" id="strategy-union">Объединить (по умолчанию)</button>';
+    html += '<button class="quick-btn" id="strategy-a">Взять всё из A</button>';
+    html += '<button class="quick-btn" id="strategy-b">Взять всё из B</button>';
+    html += '</div>';
+
+    html += '<div id="type-list"></div>';
+
+    html += '<div class="merge-panel">';
+    html += '<h2>Итоговый файл</h2>';
+    html += '<p>Чекбокс у каждого свойства решает, попадёт ли оно в итоговый файл. Если свойство отличается в A и B, дополнительно выберите, чью версию (A или B) включить.</p>';
+    html += '<div class="merge-summary" id="merge-summary"></div>';
+    html += '<div class="actions-row">';
+    html += '<button class="btn-primary" id="build-btn">Собрать итоговый файл</button>';
+    html += '<button class="btn-secondary" id="download-btn" disabled>Скачать Package.bin</button>';
+    html += '</div>';
+    html += '<textarea class="xml-preview" id="xml-preview" readonly></textarea>';
+    html += '<p class="note">Файл сохраняется в том же формате, что и на входе: Package.bin (UTF-8 с BOM, без XML-декларации, CRLF, локальные объявления префиксов). Имена префиксов пересобираются заново, поэтому перед загрузкой в конфигурацию проверьте результат в конфигураторе.</p>';
+    html += '</div>';
+
+    document.getElementById('results').innerHTML = html;
+
+    document.getElementById('search-box').addEventListener('input', (e)=>{
+      state.filterText = e.target.value;
+      renderTypeList();
+    });
+    document.getElementById('diff-only-chk').addEventListener('change', (e)=>{
+      state.diffOnly = e.target.checked;
+      renderTypeList();
+    });
+    document.getElementById('strategy-union').addEventListener('click', ()=> applyGlobalStrategy('union'));
+    document.getElementById('strategy-a').addEventListener('click', ()=> applyGlobalStrategy('A'));
+    document.getElementById('strategy-b').addEventListener('click', ()=> applyGlobalStrategy('B'));
+    document.getElementById('build-btn').addEventListener('click', buildMergedXml);
+
+    renderTypeList();
+  }
+
+  function applyGlobalStrategy(mode){
+    const all = [...state.diffValueTypes, ...state.diffTypes];
+    all.forEach(t=>{
+      const tk = typeKeyStr(t);
+      if (mode === 'union'){
+        state.typeInclude[tk] = true;
+        state.baseSide[tk] = 'A';
+      } else {
+        // mode is 'A' or 'B': include only if the type exists on that side
+        const existsOnSide = mode === 'A' ? !!t.a : !!t.b;
+        state.typeInclude[tk] = existsOnSide;
+        state.baseSide[tk] = mode;
+      }
+      t.props.forEach(p=>{
+        const pk = propKeyStr(tk, p.name);
+        if (mode === 'union'){
+          state.propInclude[pk] = true;
+          state.propSide[pk] = 'A';
+        } else {
+          const existsOnSide = mode === 'A' ? !!p.a : !!p.b;
+          state.propInclude[pk] = existsOnSide;
+          state.propSide[pk] = mode;
+        }
+      });
+    });
+    renderTypeList();
+  }
+
+  function renderTypeList(){
+    const filter = state.filterText.trim().toLowerCase();
+    const vt = state.diffValueTypes.filter(t=> matchesFilter(t, filter));
+    const ot = state.diffTypes.filter(t=> matchesFilter(t, filter));
+
+    let html = '';
+    if (vt.length){
+      html += '<div class="section-title">valueType ('+vt.length+')</div>';
+      vt.forEach(t=>{ html += renderTypeRow(t); });
+    }
+    html += '<div class="section-title">objectType ('+ot.length+')</div>';
+    if (ot.length === 0 && vt.length === 0){
+      html += '<div class="empty-state">Ничего не найдено</div>';
+    }
+    ot.forEach(t=>{ html += renderTypeRow(t); });
+
+    document.getElementById('type-list').innerHTML = html;
+    updateMergeSummary();
+    wireTypeListEvents();
+  }
+
+  function wireTypeListEvents(){
+    document.querySelectorAll('.type-head').forEach(el=>{
+      el.addEventListener('click', (e)=>{
+        if (e.target.closest('.type-chk')) return;
+        const key = el.getAttribute('data-key');
+        state.openRows[key] = !state.openRows[key];
+        renderTypeList();
+      });
+    });
+    document.querySelectorAll('.type-chk').forEach(el=>{
+      el.addEventListener('click', (e)=>{
+        e.stopPropagation();
+        const key = el.getAttribute('data-typekey');
+        state.typeInclude[key] = el.checked;
+        renderTypeList();
+      });
+    });
+    document.querySelectorAll('.base-pill').forEach(el=>{
+      el.addEventListener('click', (e)=>{
+        e.stopPropagation();
+        const key = el.getAttribute('data-typekey');
+        state.baseSide[key] = el.getAttribute('data-side');
+        renderTypeList();
+      });
+    });
+    document.querySelectorAll('.prop-chk').forEach(el=>{
+      el.addEventListener('click', (e)=>{
+        e.stopPropagation();
+        const key = el.getAttribute('data-propkey');
+        state.propInclude[key] = el.checked;
+        renderTypeList();
+      });
+    });
+    document.querySelectorAll('.prop-pill').forEach(el=>{
+      el.addEventListener('click', (e)=>{
+        e.stopPropagation();
+        const key = el.getAttribute('data-propkey');
+        state.propSide[key] = el.getAttribute('data-side');
+        renderTypeList();
+      });
+    });
+    document.querySelectorAll('.quick-btn.prop-scope').forEach(el=>{
+      el.addEventListener('click', (e)=>{
+        e.stopPropagation();
+        const tk = el.getAttribute('data-typekey');
+        const mode = el.getAttribute('data-mode');
+        const t = [...state.diffValueTypes, ...state.diffTypes].find(x=> typeKeyStr(x) === tk);
+        if (!t) return;
+        t.props.forEach(p=>{
+          const pk = propKeyStr(tk, p.name);
+          if (mode === 'union'){ state.propInclude[pk] = true; state.propSide[pk] = 'A'; }
+          else {
+            const existsOnSide = mode === 'A' ? !!p.a : !!p.b;
+            state.propInclude[pk] = existsOnSide;
+            state.propSide[pk] = mode;
+          }
+        });
+        renderTypeList();
+      });
+    });
+  }
+
+  function matchesFilter(t, filter){
+    if (state.diffOnly && t.status === 'same') return false;
+    if (!filter) return true;
+    if (t.name.toLowerCase().includes(filter)) return true;
+    if (t.props && t.props.some(p=> p.name.toLowerCase().includes(filter))) return true;
+    return false;
+  }
+
+  function renderTypeRow(t){
+    const tk = typeKeyStr(t);
+    const rowOpenKey = tk;
+    const isOpen = !!state.openRows[rowOpenKey];
+    const included = getTypeInclude(tk);
+    let html = '<div class="type-row'+(included?'':' excluded')+'">';
+    html += '<div class="type-head" data-key="'+escapeHtml(rowOpenKey)+'">';
+    html += '<input type="checkbox" class="type-chk" data-typekey="'+escapeHtml(tk)+'" '+(included?'checked':'')+'>';
+    html += '<span class="caret'+(isOpen?' open':'')+'">▶</span>';
+    html += '<span class="kind-badge">'+(t.kind==='objectType'?'obj':'val')+'</span>';
+    html += '<span class="type-name">'+escapeHtml(t.name)+'</span>';
+    html += badge(t.status);
+    html += '</div>';
+
+    html += '<div class="type-body'+(isOpen?' open':'')+'">';
+
+    // Отличия в заголовке типа: base (сравнивается по пространству имён, не по префиксу), open, sequenced.
+    const headDiffs = [];
+    if (t.a && t.b){
+      if (typeKey(t.a.base) !== typeKey(t.b.base)){
+        headDiffs.push(['base', typeLabelVs(t.a.base, t.b.base), typeLabelVs(t.b.base, t.a.base)]);
+      }
+      if ((t.a.open||'') !== (t.b.open||'')) headDiffs.push(['open', t.a.open||'—', t.b.open||'—']);
+      if ((t.a.sequenced||'') !== (t.b.sequenced||'')) headDiffs.push(['sequenced', t.a.sequenced||'—', t.b.sequenced||'—']);
+    }
+    if (headDiffs.length){
+      const side = getBaseSide(tk);
+      html += '<div class="base-line">'
+        + headDiffs.map(d=> escapeHtml(d[0])+': <span class="val-a">A='+escapeHtml(d[1])+'</span> · <span class="val-b">B='+escapeHtml(d[2])+'</span>').join(' &nbsp; ')
+        + '<span class="side-pills">'
+        + '<span class="side-pill base-pill'+(side==='A'?' active':'')+'" data-typekey="'+escapeHtml(tk)+'" data-side="A">A</span>'
+        + '<span class="side-pill base-pill'+(side==='B'?' active':'')+'" data-typekey="'+escapeHtml(tk)+'" data-side="B">B</span>'
+        + '</span></div>';
+    } else {
+      const src = t.a || t.b;
+      if (src.base) html += '<div class="base-line">base: '+escapeHtml(typeLabel(src.base))+'</div>';
+    }
+
+    if (t.props && t.props.length){
+      html += '<div class="quick-row">свойства:'
+        + ' <button class="quick-btn prop-scope" data-typekey="'+escapeHtml(tk)+'" data-mode="union">объединить</button>'
+        + ' <button class="quick-btn prop-scope" data-typekey="'+escapeHtml(tk)+'" data-mode="A">все из A</button>'
+        + ' <button class="quick-btn prop-scope" data-typekey="'+escapeHtml(tk)+'" data-mode="B">все из B</button>'
+        + '</div>';
+
+      html += '<table class="prop-table"><thead><tr><th></th><th>свойство</th><th>тип / кратность</th><th></th></tr></thead><tbody>';
+      t.props.forEach(p=>{
+        html += renderPropRow(t, tk, p);
+      });
+      html += '</tbody></table>';
+    }
+
+    html += '</div></div>';
+    return html;
+  }
+
+  function fmtProp(p, other){
+    if (!p) return null;
+    const tt = typeLabelVs(p.type, other ? other.type : null);
+    const lo = p.lowerBound, up = p.upperBound;
+    let card = '';
+    if (lo != null || up != null) card = ' ['+(lo!=null?lo:'1')+'..'+(up!=null?(up==='-1'?'∞':up):'1')+']';
+    return tt + card;
+  }
+
+  function renderPropRow(t, tk, p){
+    const pk = propKeyStr(tk, p.name);
+    const included = getPropInclude(pk);
+    const rowCls = 'prop-'+p.status + (included?'':' prop-excluded');
+    let html = '<tr class="'+rowCls+'">';
+    html += '<td class="chk-cell"><input type="checkbox" class="prop-chk" data-propkey="'+escapeHtml(pk)+'" '+(included?'checked':'')+'></td>';
+    html += '<td class="prop-name">'+escapeHtml(p.name)+'</td>';
+    html += '<td>'+renderPropValue(p)+'</td>';
+    html += '<td>'+ (p.status==='chg' ? renderPropSidePills(pk) : '') + '</td>';
+    html += '</tr>';
+    return html;
+  }
+
+  function renderPropValue(p){
+    if (p.status === 'same'){
+      return '<span>'+escapeHtml(fmtProp(p.a))+'</span>';
+    }
+    if (p.status === 'rm'){
+      return '<span class="val-diff-a">A: '+escapeHtml(fmtProp(p.a))+'</span>';
+    }
+    if (p.status === 'add'){
+      return '<span class="val-diff-b">B: '+escapeHtml(fmtProp(p.b))+'</span>';
+    }
+    return '<span class="val-diff-a">A: '+escapeHtml(fmtProp(p.a, p.b))+'</span>'
+         + '<span class="val-diff-b">B: '+escapeHtml(fmtProp(p.b, p.a))+'</span>';
+  }
+
+  function renderPropSidePills(pk){
+    const side = getPropSide(pk);
+    return '<span class="side-pills">'
+      + '<span class="side-pill prop-pill'+(side==='A'?' active':'')+'" data-propkey="'+escapeHtml(pk)+'" data-side="A">A</span>'
+      + '<span class="side-pill prop-pill'+(side==='B'?' active':'')+'" data-propkey="'+escapeHtml(pk)+'" data-side="B">B</span>'
+      + '</span>';
+  }
+
+  function updateMergeSummary(){
+    const el = document.getElementById('merge-summary');
+    if (!el) return;
+    const all = [...state.diffValueTypes, ...state.diffTypes];
+    let typesIncluded = 0, propsIncluded = 0, propsTotal = 0;
+    all.forEach(t=>{
+      const tk = typeKeyStr(t);
+      if (getTypeInclude(tk)) typesIncluded++;
+      t.props.forEach(p=>{
+        propsTotal++;
+        if (getPropInclude(propKeyStr(tk, p.name))) propsIncluded++;
+      });
+    });
+    el.innerHTML = 'Будет включено: <b>'+typesIncluded+'</b> из '+all.length+' типов, <b>'+propsIncluded+'</b> из '+propsTotal+' свойств.';
+  }
+
+  // ---------- merge / XML generation ----------
+  // Порядок элементов в итоговом файле повторяет порядок файла A, новое из B идёт после.
+  function originalOrder(listA, listB){
+    const idx = new Map();
+    (listA||[]).forEach((x,i)=>{ if (!idx.has(x.name)) idx.set(x.name, i); });
+    (listB||[]).forEach((x,i)=>{ if (!idx.has(x.name)) idx.set(x.name, 1e6 + i); });
+    return function(items){
+      return items
+        .map((x,i)=>({ x, i, ord: idx.has(x.name) ? idx.get(x.name) : 2e6 }))
+        .sort((p,q)=> p.ord - q.ord || p.i - q.i)
+        .map(e=>e.x);
+    };
+  }
+
+  function buildMergedModel(){
+    const nsBase = state.pkgA.targetNamespace || state.pkgB.targetNamespace;
+    const imports = Array.from(new Set([...(state.pkgA.imports||[]), ...(state.pkgB.imports||[])]));
+
+    const valueTypes = [];
+    state.diffValueTypes.forEach(t=>{
+      const tk = typeKeyStr(t);
+      if (!getTypeInclude(tk)) return;
+      let chosen;
+      if (t.status === 'rm') chosen = t.a;
+      else if (t.status === 'add') chosen = t.b;
+      else if (t.status === 'same') chosen = t.a;
+      else { const side = getBaseSide(tk); chosen = side === 'A' ? t.a : t.b; }
+      if (chosen) valueTypes.push(chosen);
+    });
+
+    const objectTypes = [];
+    state.diffTypes.forEach(t=>{
+      const tk = typeKeyStr(t);
+      if (!getTypeInclude(tk)) return;
+
+      // Заголовок типа (base / open / sequenced и прочие атрибуты) берём целиком с одной стороны.
+      let head;
+      if (!t.a) head = t.b;
+      else if (!t.b) head = t.a;
+      else head = getBaseSide(tk) === 'A' ? t.a : t.b;
+
+      const properties = [];
+      t.props.forEach(p=>{
+        const pk = propKeyStr(tk, p.name);
+        if (!getPropInclude(pk)) return;
+        let chosen;
+        if (p.status === 'rm') chosen = p.a;
+        else if (p.status === 'add') chosen = p.b;
+        else if (p.status === 'same') chosen = p.a;
+        else { const side = getPropSide(pk); chosen = side === 'A' ? p.a : p.b; }
+        if (chosen) properties.push(chosen);
+      });
+
+      const orderProps = originalOrder(t.a ? t.a.properties : [], t.b ? t.b.properties : []);
+      objectTypes.push({
+        name: t.name, base: head.base, attrs: head.attrs, extraNodes: head.extraNodes,
+        properties: orderProps(properties), key: t.name
+      });
+    });
+
+    const rootAttrs = (state.pkgA.rootAttrs && state.pkgA.rootAttrs.length) ? state.pkgA.rootAttrs : state.pkgB.rootAttrs;
+
+    return {
+      targetNamespace: nsBase,
+      rootAttrs,
+      imports,
+      valueTypes: originalOrder(state.pkgA.valueTypes, state.pkgB.valueTypes)(valueTypes),
+      objectTypes: originalOrder(state.pkgA.objectTypes, state.pkgB.objectTypes)(objectTypes)
+    };
+  }
+
+  function escapeXml(s){
+    return String(s==null?'':s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+  }
+
+  // Формат 1С (Package.bin): нет XML-декларации, отступы табами, переводы строк CRLF,
+  // префиксы пространств имён объявляются локально на каждом элементе как d<глубина>p<номер>.
+  const XS = 'http://www.w3.org/2001/XMLSchema';
+  const XDTO_NS = 'http://v8.1c.ru/8.1/xdto';
+
+  // Область видимости префиксов элемента: если пространство имён уже объявлено выше,
+  // используется тот же префикс, иначе объявляется новый вида d<глубина>p<номер>.
+  function nsScope(depth, parent){
+    const local = new Map();
+    let counter = 1;
+    const scope = {
+      lookup(uri){
+        if (local.has(uri)) return local.get(uri);
+        return parent ? parent.lookup(uri) : null;
+      },
+      ref(t){
+        if (!t) return null;
+        if (!t.uri) return t.local;
+        let prefix = scope.lookup(t.uri);
+        if (!prefix){
+          prefix = 'd'+depth+'p'+(counter++);
+          local.set(t.uri, prefix);
+        }
+        return prefix + ':' + t.local;
+      },
+      declarations(){
+        let s = '';
+        local.forEach((prefix, uri)=>{ s += ' xmlns:'+prefix+'="'+escapeXml(uri)+'"'; });
+        return s;
+      },
+      child(childDepth){ return nsScope(childDepth, scope); }
+    };
+    return scope;
+  }
+
+  // Базовая область видимости — объявления пространств имён с корневого элемента.
+  function rootScope(pkg){
+    const scope = nsScope(1, null);
+    const declared = new Map();
+    (pkg.rootAttrs || []).forEach(a=>{
+      if (a.name.indexOf('xmlns:') !== 0) return;
+      const prefix = a.name.slice(6);
+      if (!declared.has(a.value)) declared.set(a.value, prefix);
+    });
+    if (!declared.has(XS)) declared.set(XS, 'xs');
+    return {
+      lookup(uri){ return declared.get(uri) || null; },
+      child(depth){ return nsScope(depth, this); }
+    };
+  }
+
+  function rootAttrsString(pkg){
+    // Атрибуты корня переносим из исходного файла, targetNamespace берём из слияния.
+    const attrs = (pkg.rootAttrs || []).map(a=>({
+      name: a.name,
+      value: a.name === 'targetNamespace' ? pkg.targetNamespace : a.value
+    }));
+    const has = n => attrs.some(a=> a.name === n);
+    if (!has('xmlns')) attrs.unshift({ name: 'xmlns', value: XDTO_NS });
+    if (!has('xmlns:xs')) attrs.push({ name: 'xmlns:xs', value: XS });
+    if (!has('targetNamespace')) attrs.push({ name: 'targetNamespace', value: pkg.targetNamespace });
+    return attrs.map(a=> ' '+a.name+'="'+escapeXml(a.value)+'"').join('');
+  }
+
+  // Открывающий тег: сначала новые объявления префиксов, затем атрибуты в исходном порядке.
+  // qnameAttrs задаёт атрибуты-ссылки (base, type), значения которых пересобираются по префиксам.
+  function openTag(tag, rec, scope, qnameAttrs){
+    const refs = {};
+    Object.keys(qnameAttrs || {}).forEach(n=>{
+      if (qnameAttrs[n]) refs[n] = scope.ref(qnameAttrs[n]);
+    });
+    let s = '<' + tag + scope.declarations();
+    (rec.attrs || []).forEach(a=>{
+      const v = Object.prototype.hasOwnProperty.call(refs, a.name) ? refs[a.name] : a.value;
+      s += ' ' + a.name + '="' + escapeXml(v) + '"';
+    });
+    return s;
+  }
+
+  function generatePackage(pkg){
+    const root = rootScope(pkg);
+    const lines = [];
+    lines.push('<package'+rootAttrsString(pkg)+'>');
+
+    pkg.imports.forEach(ns=>{
+      lines.push('\t<import namespace="'+escapeXml(ns)+'"/>');
+    });
+
+    pkg.valueTypes.forEach(t=>{
+      if (!t) return;
+      const ns = root.child(2);
+      const head = openTag('valueType', t, ns, { base: t.base });
+      const extra = t.extraNodes || [];
+      if (extra.length === 0){
+        lines.push('\t'+head+'/>');
+        return;
+      }
+      lines.push('\t'+head+'>');
+      extra.forEach(x=> lines.push('\t\t'+x));
+      lines.push('\t</valueType>');
+    });
+
+    pkg.objectTypes.forEach(t=>{
+      if (!t) return;
+      const ns = root.child(2);
+      const head = openTag('objectType', t, ns, { base: t.base });
+      const extra = t.extraNodes || [];
+      if (t.properties.length === 0 && extra.length === 0){
+        lines.push('\t'+head+'/>');
+        return;
+      }
+      lines.push('\t'+head+'>');
+      t.properties.forEach(p=>{
+        const pns = ns.child(3);
+        lines.push('\t\t'+openTag('property', p, pns, { type: p.type })+'/>');
+      });
+      extra.forEach(x=> lines.push('\t\t'+x));
+      lines.push('\t</objectType>');
+    });
+
+    lines.push('</package>');
+    return lines.join('\r\n');
+  }
+
+  function mergedFileName(){
+    const src = (state.fileA && state.fileA.name) || (state.fileB && state.fileB.name) || 'Package.bin';
+    return src;
+  }
+
+  function buildMergedXml(){
+    const model = buildMergedModel();
+    const xml = generatePackage(model);
+    const preview = document.getElementById('xml-preview');
+    preview.value = xml;
+    preview.classList.add('open');
+    const dlBtn = document.getElementById('download-btn');
+    dlBtn.disabled = false;
+    dlBtn.textContent = 'Скачать ' + mergedFileName();
+    dlBtn.onclick = function(){
+      // UTF-8 с BOM, как в выгрузке 1С
+      const blob = new Blob([new Uint8Array([0xEF,0xBB,0xBF]), xml], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = mergedFileName();
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    };
+  }
+
+})();
+</script>
+</body>
+</html>
