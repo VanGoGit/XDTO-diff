@@ -271,6 +271,21 @@
   .val-diff-a{ color: var(--rm); display:block; }
   .val-diff-b{ color: var(--add); display:block; }
 
+  .diff-list{ font-family: var(--mono); font-size: 12px; margin: 0; }
+  .diff-list .diff-item{ padding: 1px 0; word-break: break-word; }
+  .diff-list .diff-path{ color: var(--muted); }
+  .diff-list .val-a{ color: var(--rm); }
+  .diff-list .val-b{ color: var(--add); }
+  .diff-list .diff-more{ color: var(--muted-2); }
+  .head-diff{ display:flex; align-items:flex-start; gap: 10px; margin-bottom: 10px; }
+  .head-diff .diff-list{ flex: 1; }
+  .summary-line{ font-family: var(--mono); font-size: 12px; color: var(--muted); margin-bottom: 8px; word-break: break-word; }
+  .pkg-diff{
+    background: var(--chg-bg); border: 1px solid rgba(251,191,36,0.3);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;
+  }
+  .pkg-diff .pkg-diff-title{ font-size: 12.5px; color: var(--chg); margin-bottom: 6px; }
+
   .side-pills{ display:flex; gap:4px; }
   .side-pill{
     font-family: var(--mono); font-size:10.5px; padding:2px 8px; border-radius:4px;
@@ -321,7 +336,7 @@
   <header>
     <p class="kicker">XDTO · сравнение и объединение пакетов 1С</p>
     <h1>XDTO Diff</h1>
-    <p>Загрузите два файла пакета XDTO из выгрузки конфигурации (<code>XDTOPackages/&lt;Имя&gt;/Ext/Package.bin</code>). Инструмент сопоставит типы по имени и пространству имён (не по автогенерируемому префиксу), покажет отличия по каждому свойству и соберёт итоговый <code>Package.bin</code> — вы решаете чекбоксом, что попадёт в результат.</p>
+    <p>Загрузите два файла пакета XDTO из выгрузки конфигурации (<code>XDTOPackages/&lt;Имя&gt;/Ext/Package.bin</code>). Инструмент сопоставит типы по имени и пространству имён (не по автогенерируемому префиксу), покажет отличия по каждому атрибуту, фасету и вложенному описанию типа и соберёт итоговый <code>Package.bin</code> — вы решаете чекбоксом, что попадёт в результат.</p>
   </header>
 
   <div class="drop-row">
@@ -349,19 +364,531 @@
 
 </div>
 
+<script id="xdto-core">
+// Ядро: разбор, сравнение, слияние и генерация пакета. Не зависит от интерфейса,
+// поэтому его же загружает tests.html.
+window.XDTOCore = (function(){
+  'use strict';
+
+  const XS = 'http://www.w3.org/2001/XMLSchema';
+  const XSI = 'http://www.w3.org/2001/XMLSchema-instance';
+  const XDTO_NS = 'http://v8.1c.ru/8.1/xdto';
+
+  // Атрибуты, значения которых — ссылки на типы (QName). Префиксы в них автогенерируемые,
+  // поэтому сравниваются они по разрешённому пространству имён, а при генерации пересобираются.
+  const QNAME_ATTRS = new Set(['type', 'base', 'itemType', 'ref']);
+  const QNAME_LIST_ATTRS = new Set(['memberTypes']);
+
+  // ---------- XML parsing ----------
+  // Chrome не разбирает объявления префиксов, у которых пространство имён не является корректным URI
+  // (1С допускает, например, xmlns:d2p1="ДопФайлУниверсальный"). Такие пространства имён перед разбором
+  // заменяются заглушками и восстанавливаются в разобранной модели.
+  let nsAliases = new Map();
+  const ALIAS_PREFIX = 'urn:xdto-diff:alias:';
+  function decodeEntities(s){
+    return s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g, (m, e)=>{
+      if (e[0] === '#') return String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10));
+      return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[e];
+    });
+  }
+  function aliasNamespaces(xmlText){
+    const byUri = new Map();
+    nsAliases = new Map();
+    return xmlText.replace(/(\sxmlns(?::[^\s=]+)?\s*=\s*)(["'])([^"']*)\2/g, (m, head, quote, value)=>{
+      if (!/[^A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]/.test(value)) return m;
+      const uri = decodeEntities(value);
+      if (!byUri.has(uri)){
+        const alias = ALIAS_PREFIX + byUri.size;
+        byUri.set(uri, alias);
+        nsAliases.set(alias, uri);
+      }
+      return head + quote + byUri.get(uri) + quote;
+    });
+  }
+  function realNs(uri){ return (uri && nsAliases.get(uri)) || uri; }
+
+  function resolveQName(el, raw){
+    // 1С иногда пишет memberTypes в нотации {uri}local
+    const m = /^\{([^}]*)\}(.*)$/.exec(raw);
+    if (m) return { uri: m[1], local: m[2], raw, clark: true };
+    const idx = raw.indexOf(':');
+    const prefix = idx === -1 ? null : raw.slice(0, idx);
+    const local = idx === -1 ? raw : raw.slice(idx+1);
+    let uri = realNs(el.lookupNamespaceURI(prefix));
+    if (uri == null && prefix === 'xs') uri = XS;
+    if (uri == null) uri = prefix ? 'unresolved:' + prefix : '';
+    return { uri, local, raw };
+  }
+
+  function qnameKind(ns, local){
+    if (!ns && QNAME_ATTRS.has(local)) return 'qname';
+    if (!ns && QNAME_LIST_ATTRS.has(local)) return 'list';
+    if (ns === XSI && local === 'type') return 'qname';
+    return null;
+  }
+
+  // Элемент разбирается целиком: все атрибуты (кроме объявлений префиксов, они пересобираются
+  // при генерации), все дочерние элементы и текст (enumeration, pattern).
+  function parseNode(el){
+    const attrs = [];
+    for (const a of Array.from(el.attributes)){
+      if (a.name === 'xmlns' || a.prefix === 'xmlns') continue;
+      const rec = { ns: realNs(a.namespaceURI) || '', local: a.localName, value: a.value };
+      const kind = qnameKind(rec.ns, rec.local);
+      if (kind === 'qname') rec.q = resolveQName(el, a.value);
+      else if (kind === 'list') rec.q = a.value.split(/\s+/).filter(Boolean).map(v=> resolveQName(el, v));
+      attrs.push(rec);
+    }
+    const children = [];
+    let text = null;
+    for (const c of Array.from(el.childNodes)){
+      if (c.nodeType === 1) children.push(parseNode(c));
+      else if (c.nodeType === 3 || c.nodeType === 4) text = (text || '') + c.nodeValue;
+    }
+    // Пробелы между дочерними элементами — форматирование, а не данные.
+    if (text != null && (children.length || (!text.trim() && el.localName !== 'enumeration' && el.localName !== 'pattern'))) text = null;
+    if (text === '') text = null;
+    return { tag: el.localName, ns: realNs(el.namespaceURI) || '', attrs, children, text };
+  }
+
+  function getAttr(n, local){
+    const a = n.attrs.find(x=> !x.ns && x.local === local);
+    return a || null;
+  }
+
+  function qKey(q){ return '{' + q.uri + '}' + q.local; }
+  function attrName(a){ return a.ns ? '{' + a.ns + '}' + a.local : a.local; }
+  function attrCanon(a){
+    if (!a.q) return a.value;
+    return Array.isArray(a.q) ? a.q.map(qKey).join(' ') : qKey(a.q);
+  }
+
+  // Каноническая запись узла: пространства имён вместо префиксов, атрибуты по алфавиту.
+  // Два узла семантически равны, если равны их канонические записи.
+  function canonNode(n){
+    if (n._canon) return n._canon;
+    const attrs = n.attrs.map(a=> attrName(a) + '=' + JSON.stringify(attrCanon(a))).sort();
+    let s = '<{' + n.ns + '}' + n.tag + (attrs.length ? ' ' + attrs.join(' ') : '') + '>';
+    if (n.text != null) s += JSON.stringify(n.text);
+    n.children.forEach(c=>{ s += canonNode(c); });
+    s += '</>';
+    Object.defineProperty(n, '_canon', { value: s, enumerable: false, writable: true });
+    return s;
+  }
+
+  // Ключ элемента внутри родителя: имя, а у свойств-ссылок без имени — ref по пространству имён.
+  function nodeKey(n){
+    const name = getAttr(n, 'name');
+    if (name) return name.value;
+    const ref = getAttr(n, 'ref');
+    if (ref && ref.q) return '@ref ' + qKey(ref.q);
+    return '@' + canonNode(n);
+  }
+  function nodeLabel(n){
+    const name = getAttr(n, 'name');
+    if (name) return name.value;
+    const ref = getAttr(n, 'ref');
+    if (ref) return 'ref → ' + ref.value;
+    return '<' + n.tag + '>';
+  }
+
+  function keyedList(nodes, kindOf){
+    const seen = new Map();
+    return nodes.map(node=>{
+      const kind = kindOf ? kindOf(node) : node.tag;
+      let key = nodeKey(node);
+      const sk = kind + '::' + key;
+      const n = (seen.get(sk) || 0) + 1;
+      seen.set(sk, n);
+      if (n > 1) key += ' #' + n;
+      return { kind, key, label: nodeLabel(node) + (n > 1 ? ' #' + n : ''), node };
+    });
+  }
+
+  function parsePackage(xmlText, label){
+    const doc = new DOMParser().parseFromString(aliasNamespaces(xmlText), 'application/xml');
+    const err = doc.getElementsByTagName('parsererror')[0];
+    if (err){
+      throw new Error('Ошибка разбора XML (' + label + '): ' + err.textContent.trim().slice(0,400));
+    }
+    const root = doc.documentElement;
+    if (!root || root.localName !== 'package'){
+      throw new Error('Файл ' + label + ' не похож на пакет XDTO: ожидался корневой элемент <package>, найден <' + (root ? root.localName : '?') + '>');
+    }
+    const pkg = {
+      targetNamespace: root.getAttribute('targetNamespace') || '',
+      rootAttrs: Array.from(root.attributes).map(a=>({ name: a.name, value: a.name === 'xmlns' || a.name.indexOf('xmlns:') === 0 ? realNs(a.value) : a.value })),
+      attrs: parseNode(root).attrs,
+      imports: [],
+      items: []
+    };
+    const items = [];
+    for (const child of Array.from(root.children)){
+      const node = parseNode(child);
+      if (node.tag === 'import') pkg.imports.push(node);
+      else items.push(node);
+    }
+    pkg.items = keyedList(items);
+    return pkg;
+  }
+
+  // ---------- diff engine ----------
+  // Порядок слияния: порядок A; элемент, которого нет в A, встаёт сразу после своего соседа по B.
+  function mergeOrder(keysA, keysB){
+    const res = keysA.slice();
+    const has = new Set(keysA);
+    let prev = null;
+    keysB.forEach(k=>{
+      if (!has.has(k)){
+        const at = prev == null ? 0 : res.indexOf(prev) + 1;
+        res.splice(at, 0, k);
+        has.add(k);
+      }
+      prev = k;
+    });
+    return res;
+  }
+
+  function matchLists(listA, listB, keyOf){
+    const mapA = new Map(listA.map(x=>[keyOf(x), x]));
+    const mapB = new Map(listB.map(x=>[keyOf(x), x]));
+    return mergeOrder(listA.map(keyOf), listB.map(keyOf)).map(k=>[k, mapA.get(k), mapB.get(k)]);
+  }
+
+  function statusOf(a, b){
+    if (a && !b) return 'rm';
+    if (!a && b) return 'add';
+    return canonNode(a) === canonNode(b) ? 'same' : 'chg';
+  }
+
+  function propsOf(node){ return keyedList(node.children.filter(c=> c.tag === 'property')); }
+  function headOf(node){ return Object.assign({}, node, { children: node.children.filter(c=> c.tag !== 'property') }); }
+
+  function diffPackages(A, B){
+    const items = matchLists(A.items, B.items, x=> x.kind + '::' + x.key).map(([k, a, b])=>{
+      const src = a || b;
+      const item = { kind: src.kind, key: src.key, label: src.label, a: a ? a.node : null, b: b ? b.node : null };
+      if (item.kind === 'objectType'){
+        const headA = a ? headOf(a.node) : null, headB = b ? headOf(b.node) : null;
+        item.headDiffs = (headA && headB) ? describeDiff(headA, headB) : [];
+        const keysA = a ? propsOf(a.node).map(x=> x.key) : [], keysB = b ? propsOf(b.node).map(x=> x.key) : [];
+        // Порядок свойств значим (sequenced): при выборе стороны B для типа берётся порядок B.
+        item.propOrderB = mergeOrder(keysB, keysA);
+        if (a && b){
+          const common = new Set(keysA.filter(k=> keysB.indexOf(k) !== -1));
+          if (keysA.filter(k=> common.has(k)).join('\n') !== keysB.filter(k=> common.has(k)).join('\n')){
+            item.headDiffs.push({ path: 'порядок свойств', a: 'как в A', b: 'как в B' });
+          }
+        }
+        item.props = matchLists(a ? propsOf(a.node) : [], b ? propsOf(b.node) : [], x=> x.key).map(([pk, pa, pb])=>{
+          const p = { key: pk, label: (pa || pb).label, a: pa ? pa.node : null, b: pb ? pb.node : null };
+          p.status = statusOf(p.a, p.b);
+          p.diffs = p.status === 'chg' ? describeDiff(p.a, p.b) : [];
+          return p;
+        });
+        if (a && b){
+          const headChanged = item.headDiffs.length > 0;
+          item.status = (headChanged || item.props.some(p=> p.status !== 'same')) ? 'chg' : 'same';
+        } else item.status = a ? 'rm' : 'add';
+      } else {
+        item.props = [];
+        item.status = statusOf(item.a, item.b);
+        item.headDiffs = item.status === 'chg' ? describeDiff(item.a, item.b) : [];
+      }
+      return item;
+    });
+    const rootA = { tag: 'package', ns: XDTO_NS, attrs: A.attrs, children: [], text: null };
+    const rootB = { tag: 'package', ns: XDTO_NS, attrs: B.attrs, children: [], text: null };
+    return { A, B, items, packageDiffs: describeDiff(rootA, rootB) };
+  }
+
+  // ---------- описание отличий ----------
+  function attrLabel(a){
+    if (a.ns === XSI) return 'xsi:' + a.local;
+    if (a.ns === XDTO_NS) return 'xdto:' + a.local;
+    if (a.ns) return '{' + a.ns + '}' + a.local;
+    return a.local;
+  }
+  // Если префиксы совпали, а пространства имён разные, показываем пространство имён — иначе отличие не видно.
+  function attrDisplay(a, other){
+    if (!a) return '—';
+    if (a.q && other && other.q && a.value === other.value) return a.value + ' = ' + attrCanon(a);
+    return a.value;
+  }
+  function childKeys(children){
+    const seen = new Map();
+    return children.map(c=>{
+      let base;
+      if (c.tag === 'property') base = 'property ' + nodeKey(c);
+      else if (c.tag === 'enumeration' || c.tag === 'pattern') base = c.tag + ' ' + canonNode(c);
+      else base = c.tag;
+      const n = (seen.get(base) || 0) + 1;
+      seen.set(base, n);
+      return n === 1 ? base : base + ' #' + n;
+    });
+  }
+  function childLabel(c){
+    if (c.tag === 'property') return 'property ' + nodeLabel(c);
+    return c.tag;
+  }
+  function summarizeNode(n){
+    if (n.tag === 'enumeration' || n.tag === 'pattern'){
+      const extra = n.attrs.map(a=> attrLabel(a) + '=' + a.value).join(' ');
+      return JSON.stringify(n.text || '') + (extra ? ' (' + extra + ')' : '');
+    }
+    let s = n.attrs.map(a=> attrLabel(a) + '=' + a.value).join(' ');
+    if (n.children.length){
+      const counts = new Map();
+      n.children.forEach(c=> counts.set(c.tag, (counts.get(c.tag) || 0) + 1));
+      s += (s ? ' ' : '') + '{ ' + Array.from(counts).map(([t, k])=> k > 1 ? t + ' ×' + k : t).join(', ') + ' }';
+    }
+    if (n.text != null) s += (s ? ' ' : '') + JSON.stringify(n.text);
+    s = s || '(пусто)';
+    return s.length > 200 ? s.slice(0, 200) + '…' : s;
+  }
+  function joinPath(path, x){ return path ? path + ' / ' + x : x; }
+
+  // Список отличий двух узлов: [{ path, a, b }]. Пустой список — узлы семантически равны.
+  function describeDiff(a, b, path, out){
+    out = out || [];
+    path = path || '';
+    const ma = new Map(a.attrs.map(x=>[attrName(x), x]));
+    const mb = new Map(b.attrs.map(x=>[attrName(x), x]));
+    const names = Array.from(new Set([...ma.keys(), ...mb.keys()]));
+    names.forEach(n=>{
+      const xa = ma.get(n), xb = mb.get(n);
+      if (xa && xb && attrCanon(xa) === attrCanon(xb)) return;
+      out.push({ path: joinPath(path, attrLabel(xa || xb)), a: attrDisplay(xa, xb), b: attrDisplay(xb, xa) });
+    });
+    if ((a.text || '') !== (b.text || '')){
+      out.push({ path: joinPath(path, 'текст'), a: a.text == null ? '—' : JSON.stringify(a.text), b: b.text == null ? '—' : JSON.stringify(b.text) });
+    }
+    const ka = childKeys(a.children), kb = childKeys(b.children);
+    const mapA = new Map(ka.map((k, i)=>[k, a.children[i]]));
+    const mapB = new Map(kb.map((k, i)=>[k, b.children[i]]));
+    const before = out.length;
+    ka.forEach(k=>{
+      const ca = mapA.get(k), cb = mapB.get(k);
+      if (!cb) out.push({ path: joinPath(path, childLabel(ca)), a: summarizeNode(ca), b: '—' });
+      else if (canonNode(ca) !== canonNode(cb)) describeDiff(ca, cb, joinPath(path, childLabel(ca)), out);
+    });
+    kb.forEach(k=>{
+      if (!mapA.has(k)){ const cb = mapB.get(k); out.push({ path: joinPath(path, childLabel(cb)), a: '—', b: summarizeNode(cb) }); }
+    });
+    if (out.length === before){
+      const orderA = ka.filter(k=> mapB.has(k)).join('\n'), orderB = kb.filter(k=> mapA.has(k)).join('\n');
+      if (orderA !== orderB) out.push({ path: joinPath(path, 'порядок дочерних элементов'), a: 'как в A', b: 'как в B' });
+    }
+    return out;
+  }
+
+  function summarizeProp(n){
+    if (!n) return '—';
+    const type = getAttr(n, 'type'), ref = getAttr(n, 'ref');
+    let s = type ? type.value : ref ? 'ref ' + ref.value : '';
+    const td = n.children.find(c=> c.tag === 'typeDef');
+    if (td) s += (s ? ' ' : '') + 'typeDef(' + summarizeNode(td) + ')';
+    const lo = getAttr(n, 'lowerBound'), up = getAttr(n, 'upperBound');
+    if (lo || up) s += ' [' + (lo ? lo.value : '1') + '..' + (up ? (up.value === '-1' ? '∞' : up.value) : '1') + ']';
+    const rest = n.attrs.filter(a=> a.ns || ['name','type','ref','lowerBound','upperBound'].indexOf(a.local) === -1);
+    if (rest.length) s += ' ' + rest.map(a=> attrLabel(a) + '=' + a.value).join(' ');
+    return s.trim() || '(без типа)';
+  }
+
+  // ---------- выбор пользователя ----------
+  function newChoices(){ return { typeInclude: {}, propInclude: {}, propSide: {}, headSide: {}, pkgSide: 'A' }; }
+  function typeKeyOf(t){ return t.kind + '::' + t.key; }
+  function propKeyOf(t, p){ return typeKeyOf(t) + '::' + p.key; }
+  function pick(status, a, b, side){
+    if (status === 'rm') return a;
+    if (status === 'add') return b;
+    if (status === 'same') return a;
+    return side === 'B' ? b : a;
+  }
+
+  // ---------- merge ----------
+  function buildMergedModel(diff, ch){
+    const pkgSrc = ch.pkgSide === 'B' ? diff.B : diff.A;
+    const other = pkgSrc === diff.A ? diff.B : diff.A;
+
+    const imports = matchLists(diff.A.imports, diff.B.imports, n=>{
+      const ns = getAttr(n, 'namespace');
+      return ns ? ns.value : canonNode(n);
+    }).map(([k, a, b])=> a || b);
+
+    const items = [];
+    diff.items.forEach(t=>{
+      const tk = typeKeyOf(t);
+      if (ch.typeInclude[tk] === false) return;
+      const headSide = ch.headSide[tk] || 'A';
+      const head = pick(t.a && t.b ? 'chg' : t.status, t.a, t.b, headSide);
+      if (t.kind !== 'objectType'){ items.push(head); return; }
+      const props = [];
+      const order = (t.a && t.b && headSide === 'B') || !t.a ? t.propOrderB : null;
+      const ordered = order ? order.map(k=> t.props.find(p=> p.key === k)) : t.props;
+      ordered.forEach(p=>{
+        const pk = propKeyOf(t, p);
+        if (ch.propInclude[pk] === false) return;
+        const chosen = pick(p.status, p.a, p.b, ch.propSide[pk] || 'A');
+        if (chosen) props.push(chosen);
+      });
+      const rest = head.children.filter(c=> c.tag !== 'property');
+      items.push(Object.assign({}, head, { children: props.concat(rest) }));
+    });
+
+    return {
+      targetNamespace: pkgSrc.targetNamespace,
+      rootAttrs: pkgSrc.rootAttrs,
+      extraRootAttrs: other.rootAttrs.filter(a=> a.name.indexOf('xmlns:') === 0),
+      imports,
+      items
+    };
+  }
+
+  // ---------- XML generation ----------
+  function escapeAttr(s){
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;').replace(/\t/g,'&#9;').replace(/\n/g,'&#10;').replace(/\r/g,'&#13;');
+  }
+  function escapeText(s){
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\r/g,'&#13;');
+  }
+
+  // Формат 1С (Package.bin): нет XML-декларации, отступы табами, переводы строк CRLF,
+  // префиксы пространств имён объявляются локально на каждом элементе как d<глубина>p<номер>.
+  // Пространство имён по умолчанию везде — http://v8.1c.ru/8.1/xdto.
+  function nsScope(depth, parent){
+    const local = new Map();
+    let counter = 1;
+    const scope = {
+      lookup(uri){
+        if (local.has(uri)) return local.get(uri);
+        return parent ? parent.lookup(uri) : null;
+      },
+      prefix(uri){
+        let prefix = scope.lookup(uri);
+        if (!prefix){
+          prefix = 'd' + depth + 'p' + (counter++);
+          local.set(uri, prefix);
+        }
+        return prefix;
+      },
+      qname(q){
+        if (q.clark) return '{' + q.uri + '}' + q.local;
+        if (q.uri === XDTO_NS || q.uri === '') return q.local;
+        if (q.uri.indexOf('unresolved:') === 0) return q.raw;
+        return scope.prefix(q.uri) + ':' + q.local;
+      },
+      declarations(){
+        let s = '';
+        local.forEach((prefix, uri)=>{ s += ' xmlns:' + prefix + '="' + escapeAttr(uri) + '"'; });
+        return s;
+      },
+      child(childDepth){ return nsScope(childDepth, scope); }
+    };
+    return scope;
+  }
+
+  function rootDeclarations(attrs){
+    const declared = new Map();
+    attrs.forEach(a=>{
+      if (a.name.indexOf('xmlns:') !== 0) return;
+      if (!declared.has(a.value)) declared.set(a.value, a.name.slice(6));
+    });
+    return declared;
+  }
+
+  function usesNs(nodes, uri){
+    return nodes.some(n=> n.ns === uri || n.attrs.some(a=> a.ns === uri) || usesNs(n.children, uri));
+  }
+
+  function rootAttrsList(pkg){
+    // Атрибуты корня переносим из исходного файла; недостающие объявления префиксов — с другой стороны.
+    const attrs = (pkg.rootAttrs || []).map(a=>({
+      name: a.name,
+      value: a.name === 'targetNamespace' ? pkg.targetNamespace : a.value
+    }));
+    const has = n=> attrs.some(a=> a.name === n);
+    const lastDecl = ()=>{ let i = -1; attrs.forEach((a, k)=>{ if (a.name === 'xmlns' || a.name.indexOf('xmlns:') === 0) i = k; }); return i; };
+    const insertDecl = a=>{ attrs.splice(lastDecl() + 1, 0, a); };
+    if (!has('xmlns')) attrs.unshift({ name: 'xmlns', value: XDTO_NS });
+    if (!has('xmlns:xs')) insertDecl({ name: 'xmlns:xs', value: XS });
+    const declared = rootDeclarations(attrs);
+    (pkg.extraRootAttrs || []).forEach(a=>{
+      if (!declared.has(a.value) && !has(a.name)){ insertDecl(a); declared.set(a.value, a.name.slice(6)); }
+    });
+    if (!declared.has(XSI) && !has('xmlns:xsi') && usesNs(pkg.items, XSI)) insertDecl({ name: 'xmlns:xsi', value: XSI });
+    if (!has('targetNamespace')) attrs.push({ name: 'targetNamespace', value: pkg.targetNamespace });
+    return attrs;
+  }
+
+  function writeNode(n, parentScope, depth, indent, lines){
+    const scope = parentScope.child(depth);
+    let attrs = '';
+    n.attrs.forEach(a=>{
+      const name = a.ns ? scope.prefix(a.ns) + ':' + a.local : a.local;
+      let v = a.value;
+      if (a.q) v = Array.isArray(a.q) ? a.q.map(q=> scope.qname(q)).join(' ') : scope.qname(a.q);
+      attrs += ' ' + name + '="' + escapeAttr(v) + '"';
+    });
+    // Элемент с атрибутом из пространства имён xdto (xdto:qualified) 1С пишет с тем же префиксом.
+    const xdtoPrefix = n.attrs.some(a=> a.ns === XDTO_NS) ? scope.lookup(XDTO_NS) : null;
+    const tag = n.ns === XDTO_NS || !n.ns
+      ? (xdtoPrefix ? xdtoPrefix + ':' + n.tag : n.tag)
+      : scope.prefix(n.ns) + ':' + n.tag;
+    const open = '<' + tag + scope.declarations() + attrs;
+    if (!n.children.length){
+      if (n.text == null) lines.push(indent + open + '/>');
+      else lines.push(indent + open + '>' + escapeText(n.text) + '</' + tag + '>');
+      return;
+    }
+    lines.push(indent + open + '>');
+    n.children.forEach(c=> writeNode(c, scope, depth + 1, indent + '\t', lines));
+    lines.push(indent + '</' + tag + '>');
+  }
+
+  function generatePackage(pkg){
+    const attrs = rootAttrsList(pkg);
+    const declared = rootDeclarations(attrs);
+    const root = {
+      lookup(uri){ return declared.get(uri) || null; },
+      child(depth){ return nsScope(depth, this); }
+    };
+    const lines = ['<package' + attrs.map(a=> ' ' + a.name + '="' + escapeAttr(a.value) + '"').join('') + '>'];
+    pkg.imports.forEach(n=> writeNode(n, root, 2, '\t', lines));
+    pkg.items.forEach(n=> writeNode(n, root, 2, '\t', lines));
+    lines.push('</package>');
+    return lines.join('\r\n');
+  }
+
+  // Каноническая запись всего пакета (для проверки «слияние с самим собой не меняет пакет»).
+  function canonPackage(pkg){
+    const attrs = pkg.attrs.map(a=> attrName(a) + '=' + JSON.stringify(attrCanon(a))).sort().join(' ');
+    return [attrs]
+      .concat(pkg.imports.map(canonNode))
+      .concat(pkg.items.map(x=> canonNode(x.node)))
+      .join('\n');
+  }
+
+  return {
+    XS, XSI, XDTO_NS,
+    parsePackage, diffPackages, buildMergedModel, generatePackage,
+    canonNode, canonPackage, describeDiff, summarizeNode, summarizeProp,
+    newChoices, typeKeyOf, propKeyOf
+  };
+})();
+</script>
 <script>
 (function(){
+  const X = window.XDTOCore;
 
   // ---------- state ----------
   const state = {
     fileA: null, fileB: null,
-    pkgA: null, pkgB: null,
-    diffTypes: null,
-    diffValueTypes: null,
-    typeInclude: {},   // key: kind::name -> bool, default true
-    propInclude: {},   // key: kind::name::propName -> bool, default true
-    propSide: {},      // key: kind::name::propName -> 'A'|'B', default 'A'
-    baseSide: {},      // key: kind::name -> 'A'|'B', default 'A'
+    diff: null,
+    ch: X.newChoices(),  // typeInclude / propInclude: false — исключено; propSide / headSide / pkgSide: 'A'|'B'
     openRows: {},
     filterText: '',
     diffOnly: false,
@@ -427,188 +954,38 @@
   }
   function clearError(){ document.getElementById('error-slot').innerHTML = ''; }
 
-  // ---------- XML parsing ----------
-  function resolvePrefix(el, prefix){
-    let node = el;
-    while (node && node.nodeType === 1){
-      const attrName = prefix ? ('xmlns:' + prefix) : 'xmlns';
-      if (node.hasAttribute && node.hasAttribute(attrName)) return node.getAttribute(attrName);
-      node = node.parentElement;
-    }
-    if (prefix === 'xs') return 'http://www.w3.org/2001/XMLSchema';
-    return null;
-  }
-
-  function resolveQName(el, qname){
-    if (!qname) return null;
-    const idx = qname.indexOf(':');
-    if (idx === -1){
-      const uri = resolvePrefix(el, null);
-      return { uri: uri || '', local: qname, raw: qname };
-    }
-    const prefix = qname.slice(0, idx);
-    const local = qname.slice(idx+1);
-    const uri = resolvePrefix(el, prefix);
-    return { uri: uri || ('unresolved:'+prefix), local, raw: qname };
-  }
-
-  function typeKey(t){ if (!t) return ''; return t.uri + '#' + t.local; }
-  function typeLabel(t){ if (!t) return '—'; return t.raw; }
-
-  // Префиксы в файлах автогенерируемые, поэтому две разные ссылки могут выглядеть одинаково.
-  // В таком случае показываем пространство имён, иначе отличие не видно.
-  function typeLabelVs(t, other){
-    if (!t) return '—';
-    if (other && t.raw === other.raw && t.uri !== other.uri) return t.raw + ' {' + t.uri + '}';
-    return t.raw;
-  }
-
-  // Все атрибуты элемента в исходном порядке, кроме объявлений пространств имён:
-  // они пересобираются при генерации, остальные (form, nillable и прочие) переносятся как есть.
-  function ownAttrs(el){
-    return Array.from(el.attributes)
-      .filter(a=> a.name !== 'xmlns' && a.name.indexOf('xmlns:') !== 0)
-      .map(a=>({ name: a.name, value: a.value }));
-  }
-
-  // Незнакомые дочерние элементы сохраняются в исходном виде, чтобы ничего не потерять.
-  function extraChildren(el, knownLocalName){
-    const ser = new XMLSerializer();
-    return Array.from(el.children)
-      .filter(c=> c.localName !== knownLocalName)
-      .map(c=> ser.serializeToString(c));
-  }
-
-  function parsePackage(xmlText, label){
-    const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
-    const err = doc.querySelector('parsererror');
-    if (err){
-      throw new Error('Ошибка разбора XML (' + label + '): ' + err.textContent.trim().slice(0,400));
-    }
-    const root = doc.documentElement;
-    if (!root || root.localName !== 'package'){
-      throw new Error('Файл ' + label + ' не похож на пакет XDTO: ожидался корневой элемент <package>, найден <' + (root ? root.localName : '?') + '>');
-    }
-    const pkg = {
-      targetNamespace: root.getAttribute('targetNamespace') || '',
-      rootAttrs: Array.from(root.attributes).map(a=>({ name: a.name, value: a.value })),
-      imports: [], valueTypes: [], objectTypes: []
-    };
-    for (const child of Array.from(root.children)){
-      if (child.localName === 'import'){
-        const ns = child.getAttribute('namespace');
-        if (ns && pkg.imports.indexOf(ns) === -1) pkg.imports.push(ns);
-      } else if (child.localName === 'valueType'){
-        const name = child.getAttribute('name');
-        const baseRaw = child.getAttribute('base');
-        const base = baseRaw ? resolveQName(child, baseRaw) : null;
-        pkg.valueTypes.push({ name, base, attrs: ownAttrs(child), extraNodes: extraChildren(child, null), key: name });
-      } else if (child.localName === 'objectType'){
-        const name = child.getAttribute('name');
-        const baseRaw = child.getAttribute('base');
-        const base = baseRaw ? resolveQName(child, baseRaw) : null;
-        const open = child.getAttribute('open');
-        const sequenced = child.getAttribute('sequenced');
-        const properties = [];
-        for (const p of Array.from(child.children)){
-          if (p.localName !== 'property') continue;
-          const pname = p.getAttribute('name');
-          const typeRaw = p.getAttribute('type');
-          const type = typeRaw ? resolveQName(p, typeRaw) : null;
-          properties.push({
-            name: pname, type,
-            lowerBound: p.getAttribute('lowerBound'), upperBound: p.getAttribute('upperBound'),
-            attrs: ownAttrs(p)
-          });
-        }
-        pkg.objectTypes.push({
-          name, base, open, sequenced, properties,
-          attrs: ownAttrs(child), extraNodes: extraChildren(child, 'property'), key: name
-        });
-      }
-    }
-    return pkg;
-  }
-
-  // ---------- diff engine ----------
-  function propSignature(p){ return [typeKey(p.type), p.lowerBound||'', p.upperBound||''].join('|'); }
-
-  function diffProperties(propsA, propsB){
-    const mapA = new Map(propsA.map(p=>[p.name, p]));
-    const mapB = new Map(propsB.map(p=>[p.name, p]));
-    const names = Array.from(new Set([...mapA.keys(), ...mapB.keys()])).sort((x,y)=>x.localeCompare(y));
-    return names.map(name=>{
-      const a = mapA.get(name), b = mapB.get(name);
-      let status;
-      if (a && !b) status = 'rm';
-      else if (!a && b) status = 'add';
-      else if (propSignature(a) !== propSignature(b)) status = 'chg';
-      else status = 'same';
-      return { name, a, b, status };
-    });
-  }
-
-  function diffObjectTypes(listA, listB){
-    const mapA = new Map(listA.map(t=>[t.key, t]));
-    const mapB = new Map(listB.map(t=>[t.key, t]));
-    const names = Array.from(new Set([...mapA.keys(), ...mapB.keys()])).sort((x,y)=>x.localeCompare(y));
-    return names.map(name=>{
-      const a = mapA.get(name), b = mapB.get(name);
-      let status, props = [];
-      if (a && !b){ status = 'rm'; props = diffProperties(a.properties, []); }
-      else if (!a && b){ status = 'add'; props = diffProperties([], b.properties); }
-      else {
-        props = diffProperties(a.properties, b.properties);
-        const baseChanged = typeKey(a.base) !== typeKey(b.base) || (a.open||'')!==(b.open||'') || (a.sequenced||'')!==(b.sequenced||'');
-        const propsChanged = props.some(p=>p.status !== 'same');
-        status = (baseChanged || propsChanged) ? 'chg' : 'same';
-      }
-      return { kind:'objectType', name, a, b, status, props };
-    });
-  }
-
-  function diffValueTypes(listA, listB){
-    const mapA = new Map(listA.map(t=>[t.key, t]));
-    const mapB = new Map(listB.map(t=>[t.key, t]));
-    const names = Array.from(new Set([...mapA.keys(), ...mapB.keys()])).sort((x,y)=>x.localeCompare(y));
-    return names.map(name=>{
-      const a = mapA.get(name), b = mapB.get(name);
-      let status;
-      if (a && !b) status = 'rm';
-      else if (!a && b) status = 'add';
-      else status = (typeKey(a.base) !== typeKey(b.base)) ? 'chg' : 'same';
-      return { kind:'valueType', name, a, b, status, props: [] };
-    });
-  }
-
   // ---------- compare action ----------
   document.getElementById('compare-btn').addEventListener('click', ()=>{
     clearError();
+    let pkgA, pkgB;
     try{
-      state.pkgA = parsePackage(state.fileA.text, state.fileA.name);
-      state.pkgB = parsePackage(state.fileB.text, state.fileB.name);
+      pkgA = X.parsePackage(state.fileA.text, state.fileA.name);
+      pkgB = X.parsePackage(state.fileB.text, state.fileB.name);
     } catch(e){
       showError(e.message);
       document.getElementById('results').innerHTML = '';
       return;
     }
-    state.diffTypes = diffObjectTypes(state.pkgA.objectTypes, state.pkgB.objectTypes);
-    state.diffValueTypes = diffValueTypes(state.pkgA.valueTypes, state.pkgB.valueTypes);
-    state.typeInclude = {};
-    state.propInclude = {};
-    state.propSide = {};
-    state.baseSide = {};
+    state.diff = X.diffPackages(pkgA, pkgB);
+    state.ch = X.newChoices();
     state.openRows = {};
     renderResults();
   });
 
   // ---------- state helpers ----------
-  function typeKeyStr(t){ return t.kind + '::' + t.name; }
-  function propKeyStr(tk, propName){ return tk + '::' + propName; }
-  function getTypeInclude(tk){ return state.typeInclude[tk] !== false; }
-  function getPropInclude(pk){ return state.propInclude[pk] !== false; }
-  function getPropSide(pk){ return state.propSide[pk] || 'A'; }
-  function getBaseSide(tk){ return state.baseSide[tk] || 'A'; }
+  const typeKeyStr = X.typeKeyOf;
+  const propKeyStr = X.propKeyOf;
+  function getTypeInclude(tk){ return state.ch.typeInclude[tk] !== false; }
+  function getPropInclude(pk){ return state.ch.propInclude[pk] !== false; }
+  function getPropSide(pk){ return state.ch.propSide[pk] || 'A'; }
+  function getBaseSide(tk){ return state.ch.headSide[tk] || 'A'; }
+
+  const SECTIONS = [
+    { kind: 'property', title: 'property — корневые свойства', badge: 'prop' },
+    { kind: 'valueType', title: 'valueType', badge: 'val' },
+    { kind: 'objectType', title: 'objectType', badge: 'obj' },
+  ];
+  function sectionOf(kind){ return SECTIONS.find(s=> s.kind === kind) || { kind, title: kind, badge: kind }; }
 
   // ---------- rendering ----------
   function escapeHtml(s){
@@ -629,11 +1006,35 @@
     return c;
   }
 
+  function sidePills(cls, attr, key, side){
+    return '<span class="side-pills">'
+      + '<span class="side-pill '+cls+(side==='A'?' active':'')+'" '+attr+'="'+escapeHtml(key)+'" data-side="A">A</span>'
+      + '<span class="side-pill '+cls+(side==='B'?' active':'')+'" '+attr+'="'+escapeHtml(key)+'" data-side="B">B</span>'
+      + '</span>';
+  }
+
+  // Список отличий: какой атрибут / фасет / дочерний элемент и какие значения в A и B.
+  function renderDiffList(diffs, limit){
+    limit = limit || 40;
+    let html = '<div class="diff-list">';
+    diffs.slice(0, limit).forEach(d=>{
+      html += '<div class="diff-item"><span class="diff-path">'+escapeHtml(d.path)+':</span> '
+        + '<span class="val-a">A='+escapeHtml(d.a)+'</span> · <span class="val-b">B='+escapeHtml(d.b)+'</span></div>';
+    });
+    if (diffs.length > limit) html += '<div class="diff-more">… ещё '+(diffs.length - limit)+'</div>';
+    html += '</div>';
+    return html;
+  }
+
   function renderResults(){
-    const all = [...state.diffValueTypes, ...state.diffTypes];
+    const all = state.diff.items;
     const counts = countBy(all);
 
     let html = '';
+    if (state.diff.packageDiffs.length){
+      html += '<div class="pkg-diff"><div class="pkg-diff-title">Отличаются атрибуты пакета — какие взять:</div>'
+        + '<div class="head-diff">' + renderDiffList(state.diff.packageDiffs) + '<span id="pkg-pills"></span></div></div>';
+    }
     html += '<div class="stats">';
     html += '<div class="stat"><span class="dot rm"></span><b>'+counts.rm+'</b><span>только в A</span></div>';
     html += '<div class="stat"><span class="dot add"></span><b>'+counts.add+'</b><span>только в B</span></div>';
@@ -657,7 +1058,7 @@
 
     html += '<div class="merge-panel">';
     html += '<h2>Итоговый файл</h2>';
-    html += '<p>Чекбокс у каждого свойства решает, попадёт ли оно в итоговый файл. Если свойство отличается в A и B, дополнительно выберите, чью версию (A или B) включить.</p>';
+    html += '<p>Чекбокс у каждого типа и свойства решает, попадёт ли оно в итоговый файл. Если версии в A и B отличаются, дополнительно выберите, чью версию (A или B) включить: она переносится целиком, со всеми атрибутами, фасетами и вложенным typeDef.</p>';
     html += '<div class="merge-summary" id="merge-summary"></div>';
     html += '<div class="actions-row">';
     html += '<button class="btn-primary" id="build-btn">Собрать итоговый файл</button>';
@@ -669,6 +1070,7 @@
 
     document.getElementById('results').innerHTML = html;
 
+    renderPkgPills();
     document.getElementById('search-box').addEventListener('input', (e)=>{
       state.filterText = e.target.value;
       renderTypeList();
@@ -685,28 +1087,38 @@
     renderTypeList();
   }
 
+  function renderPkgPills(){
+    const slot = document.getElementById('pkg-pills');
+    if (!slot) return;
+    slot.innerHTML = sidePills('pkg-pill', 'data-pkg', 'pkg', state.ch.pkgSide);
+    slot.querySelectorAll('.pkg-pill').forEach(el=>{
+      el.addEventListener('click', ()=>{ state.ch.pkgSide = el.getAttribute('data-side'); renderPkgPills(); });
+    });
+  }
+
   function applyGlobalStrategy(mode){
-    const all = [...state.diffValueTypes, ...state.diffTypes];
-    all.forEach(t=>{
+    state.ch.pkgSide = mode === 'B' ? 'B' : 'A';
+    renderPkgPills();
+    state.diff.items.forEach(t=>{
       const tk = typeKeyStr(t);
       if (mode === 'union'){
-        state.typeInclude[tk] = true;
-        state.baseSide[tk] = 'A';
+        state.ch.typeInclude[tk] = true;
+        state.ch.headSide[tk] = 'A';
       } else {
         // mode is 'A' or 'B': include only if the type exists on that side
         const existsOnSide = mode === 'A' ? !!t.a : !!t.b;
-        state.typeInclude[tk] = existsOnSide;
-        state.baseSide[tk] = mode;
+        state.ch.typeInclude[tk] = existsOnSide;
+        state.ch.headSide[tk] = mode;
       }
       t.props.forEach(p=>{
-        const pk = propKeyStr(tk, p.name);
+        const pk = propKeyStr(t, p);
         if (mode === 'union'){
-          state.propInclude[pk] = true;
-          state.propSide[pk] = 'A';
+          state.ch.propInclude[pk] = true;
+          state.ch.propSide[pk] = 'A';
         } else {
           const existsOnSide = mode === 'A' ? !!p.a : !!p.b;
-          state.propInclude[pk] = existsOnSide;
-          state.propSide[pk] = mode;
+          state.ch.propInclude[pk] = existsOnSide;
+          state.ch.propSide[pk] = mode;
         }
       });
     });
@@ -715,24 +1127,27 @@
 
   function renderTypeList(){
     const filter = state.filterText.trim().toLowerCase();
-    const vt = state.diffValueTypes.filter(t=> matchesFilter(t, filter));
-    const ot = state.diffTypes.filter(t=> matchesFilter(t, filter));
+    const kinds = Array.from(new Set(SECTIONS.map(s=> s.kind).concat(state.diff.items.map(t=> t.kind))));
 
     let html = '';
-    if (vt.length){
-      html += '<div class="section-title">valueType ('+vt.length+')</div>';
-      vt.forEach(t=>{ html += renderTypeRow(t); });
-    }
-    html += '<div class="section-title">objectType ('+ot.length+')</div>';
-    if (ot.length === 0 && vt.length === 0){
-      html += '<div class="empty-state">Ничего не найдено</div>';
-    }
-    ot.forEach(t=>{ html += renderTypeRow(t); });
+    let shown = 0;
+    kinds.forEach(kind=>{
+      const list = state.diff.items
+        .filter(t=> t.kind === kind && matchesFilter(t, filter))
+        .sort((x,y)=> x.label.localeCompare(y.label));
+      if (!list.length && kind !== 'objectType') return;
+      html += '<div class="section-title">'+escapeHtml(sectionOf(kind).title)+' ('+list.length+')</div>';
+      list.forEach(t=>{ html += renderTypeRow(t); });
+      shown += list.length;
+    });
+    if (shown === 0) html += '<div class="empty-state">Ничего не найдено</div>';
 
     document.getElementById('type-list').innerHTML = html;
     updateMergeSummary();
     wireTypeListEvents();
   }
+
+  function findType(tk){ return state.diff.items.find(x=> typeKeyStr(x) === tk); }
 
   function wireTypeListEvents(){
     document.querySelectorAll('.type-head').forEach(el=>{
@@ -747,7 +1162,7 @@
       el.addEventListener('click', (e)=>{
         e.stopPropagation();
         const key = el.getAttribute('data-typekey');
-        state.typeInclude[key] = el.checked;
+        state.ch.typeInclude[key] = el.checked;
         renderTypeList();
       });
     });
@@ -755,7 +1170,7 @@
       el.addEventListener('click', (e)=>{
         e.stopPropagation();
         const key = el.getAttribute('data-typekey');
-        state.baseSide[key] = el.getAttribute('data-side');
+        state.ch.headSide[key] = el.getAttribute('data-side');
         renderTypeList();
       });
     });
@@ -763,7 +1178,7 @@
       el.addEventListener('click', (e)=>{
         e.stopPropagation();
         const key = el.getAttribute('data-propkey');
-        state.propInclude[key] = el.checked;
+        state.ch.propInclude[key] = el.checked;
         renderTypeList();
       });
     });
@@ -771,7 +1186,7 @@
       el.addEventListener('click', (e)=>{
         e.stopPropagation();
         const key = el.getAttribute('data-propkey');
-        state.propSide[key] = el.getAttribute('data-side');
+        state.ch.propSide[key] = el.getAttribute('data-side');
         renderTypeList();
       });
     });
@@ -780,15 +1195,15 @@
         e.stopPropagation();
         const tk = el.getAttribute('data-typekey');
         const mode = el.getAttribute('data-mode');
-        const t = [...state.diffValueTypes, ...state.diffTypes].find(x=> typeKeyStr(x) === tk);
+        const t = findType(tk);
         if (!t) return;
         t.props.forEach(p=>{
-          const pk = propKeyStr(tk, p.name);
-          if (mode === 'union'){ state.propInclude[pk] = true; state.propSide[pk] = 'A'; }
+          const pk = propKeyStr(t, p);
+          if (mode === 'union'){ state.ch.propInclude[pk] = true; state.ch.propSide[pk] = 'A'; }
           else {
             const existsOnSide = mode === 'A' ? !!p.a : !!p.b;
-            state.propInclude[pk] = existsOnSide;
-            state.propSide[pk] = mode;
+            state.ch.propInclude[pk] = existsOnSide;
+            state.ch.propSide[pk] = mode;
           }
         });
         renderTypeList();
@@ -799,8 +1214,8 @@
   function matchesFilter(t, filter){
     if (state.diffOnly && t.status === 'same') return false;
     if (!filter) return true;
-    if (t.name.toLowerCase().includes(filter)) return true;
-    if (t.props && t.props.some(p=> p.name.toLowerCase().includes(filter))) return true;
+    if (t.label.toLowerCase().includes(filter)) return true;
+    if (t.props && t.props.some(p=> p.label.toLowerCase().includes(filter))) return true;
     return false;
   }
 
@@ -813,33 +1228,24 @@
     html += '<div class="type-head" data-key="'+escapeHtml(rowOpenKey)+'">';
     html += '<input type="checkbox" class="type-chk" data-typekey="'+escapeHtml(tk)+'" '+(included?'checked':'')+'>';
     html += '<span class="caret'+(isOpen?' open':'')+'">▶</span>';
-    html += '<span class="kind-badge">'+(t.kind==='objectType'?'obj':'val')+'</span>';
-    html += '<span class="type-name">'+escapeHtml(t.name)+'</span>';
+    html += '<span class="kind-badge">'+escapeHtml(sectionOf(t.kind).badge)+'</span>';
+    html += '<span class="type-name">'+escapeHtml(t.label)+'</span>';
     html += badge(t.status);
     html += '</div>';
 
-    html += '<div class="type-body'+(isOpen?' open':'')+'">';
+    if (!isOpen){ html += '</div>'; return html; }
+    html += '<div class="type-body open">';
 
-    // Отличия в заголовке типа: base (сравнивается по пространству имён, не по префиксу), open, sequenced.
-    const headDiffs = [];
-    if (t.a && t.b){
-      if (typeKey(t.a.base) !== typeKey(t.b.base)){
-        headDiffs.push(['base', typeLabelVs(t.a.base, t.b.base), typeLabelVs(t.b.base, t.a.base)]);
-      }
-      if ((t.a.open||'') !== (t.b.open||'')) headDiffs.push(['open', t.a.open||'—', t.b.open||'—']);
-      if ((t.a.sequenced||'') !== (t.b.sequenced||'')) headDiffs.push(['sequenced', t.a.sequenced||'—', t.b.sequenced||'—']);
-    }
-    if (headDiffs.length){
-      const side = getBaseSide(tk);
-      html += '<div class="base-line">'
-        + headDiffs.map(d=> escapeHtml(d[0])+': <span class="val-a">A='+escapeHtml(d[1])+'</span> · <span class="val-b">B='+escapeHtml(d[2])+'</span>').join(' &nbsp; ')
-        + '<span class="side-pills">'
-        + '<span class="side-pill base-pill'+(side==='A'?' active':'')+'" data-typekey="'+escapeHtml(tk)+'" data-side="A">A</span>'
-        + '<span class="side-pill base-pill'+(side==='B'?' active':'')+'" data-typekey="'+escapeHtml(tk)+'" data-side="B">B</span>'
-        + '</span></div>';
+    // Отличия самого типа (для objectType — без свойств): все атрибуты, фасеты, enumeration, pattern, typeDef.
+    if (t.a && t.b && t.headDiffs.length){
+      html += '<div class="head-diff">' + renderDiffList(t.headDiffs)
+        + sidePills('base-pill', 'data-typekey', tk, getBaseSide(tk)) + '</div>';
     } else {
       const src = t.a || t.b;
-      if (src.base) html += '<div class="base-line">base: '+escapeHtml(typeLabel(src.base))+'</div>';
+      const summary = t.kind === 'objectType'
+        ? X.summarizeNode(Object.assign({}, src, { children: src.children.filter(c=> c.tag !== 'property') }))
+        : t.kind === 'property' ? X.summarizeProp(src) : X.summarizeNode(src);
+      html += '<div class="summary-line">'+escapeHtml(summary)+'</div>';
     }
 
     if (t.props && t.props.length){
@@ -849,9 +1255,9 @@
         + ' <button class="quick-btn prop-scope" data-typekey="'+escapeHtml(tk)+'" data-mode="B">все из B</button>'
         + '</div>';
 
-      html += '<table class="prop-table"><thead><tr><th></th><th>свойство</th><th>тип / кратность</th><th></th></tr></thead><tbody>';
+      html += '<table class="prop-table"><thead><tr><th></th><th>свойство</th><th>описание / отличия</th><th></th></tr></thead><tbody>';
       t.props.forEach(p=>{
-        html += renderPropRow(t, tk, p);
+        html += renderPropRow(t, p);
       });
       html += '</tbody></table>';
     }
@@ -860,275 +1266,51 @@
     return html;
   }
 
-  function fmtProp(p, other){
-    if (!p) return null;
-    const tt = typeLabelVs(p.type, other ? other.type : null);
-    const lo = p.lowerBound, up = p.upperBound;
-    let card = '';
-    if (lo != null || up != null) card = ' ['+(lo!=null?lo:'1')+'..'+(up!=null?(up==='-1'?'∞':up):'1')+']';
-    return tt + card;
-  }
-
-  function renderPropRow(t, tk, p){
-    const pk = propKeyStr(tk, p.name);
+  function renderPropRow(t, p){
+    const pk = propKeyStr(t, p);
     const included = getPropInclude(pk);
     const rowCls = 'prop-'+p.status + (included?'':' prop-excluded');
     let html = '<tr class="'+rowCls+'">';
     html += '<td class="chk-cell"><input type="checkbox" class="prop-chk" data-propkey="'+escapeHtml(pk)+'" '+(included?'checked':'')+'></td>';
-    html += '<td class="prop-name">'+escapeHtml(p.name)+'</td>';
+    html += '<td class="prop-name">'+escapeHtml(p.label)+'</td>';
     html += '<td>'+renderPropValue(p)+'</td>';
-    html += '<td>'+ (p.status==='chg' ? renderPropSidePills(pk) : '') + '</td>';
+    html += '<td>'+ (p.status==='chg' ? sidePills('prop-pill', 'data-propkey', pk, getPropSide(pk)) : '') + '</td>';
     html += '</tr>';
     return html;
   }
 
   function renderPropValue(p){
-    if (p.status === 'same'){
-      return '<span>'+escapeHtml(fmtProp(p.a))+'</span>';
-    }
-    if (p.status === 'rm'){
-      return '<span class="val-diff-a">A: '+escapeHtml(fmtProp(p.a))+'</span>';
-    }
-    if (p.status === 'add'){
-      return '<span class="val-diff-b">B: '+escapeHtml(fmtProp(p.b))+'</span>';
-    }
-    return '<span class="val-diff-a">A: '+escapeHtml(fmtProp(p.a, p.b))+'</span>'
-         + '<span class="val-diff-b">B: '+escapeHtml(fmtProp(p.b, p.a))+'</span>';
-  }
-
-  function renderPropSidePills(pk){
-    const side = getPropSide(pk);
-    return '<span class="side-pills">'
-      + '<span class="side-pill prop-pill'+(side==='A'?' active':'')+'" data-propkey="'+escapeHtml(pk)+'" data-side="A">A</span>'
-      + '<span class="side-pill prop-pill'+(side==='B'?' active':'')+'" data-propkey="'+escapeHtml(pk)+'" data-side="B">B</span>'
-      + '</span>';
+    if (p.status === 'same') return '<span>'+escapeHtml(X.summarizeProp(p.a))+'</span>';
+    if (p.status === 'rm') return '<span class="val-diff-a">A: '+escapeHtml(X.summarizeProp(p.a))+'</span>';
+    if (p.status === 'add') return '<span class="val-diff-b">B: '+escapeHtml(X.summarizeProp(p.b))+'</span>';
+    return renderDiffList(p.diffs);
   }
 
   function updateMergeSummary(){
     const el = document.getElementById('merge-summary');
     if (!el) return;
-    const all = [...state.diffValueTypes, ...state.diffTypes];
+    const all = state.diff.items;
     let typesIncluded = 0, propsIncluded = 0, propsTotal = 0;
     all.forEach(t=>{
       const tk = typeKeyStr(t);
       if (getTypeInclude(tk)) typesIncluded++;
       t.props.forEach(p=>{
         propsTotal++;
-        if (getPropInclude(propKeyStr(tk, p.name))) propsIncluded++;
+        if (getPropInclude(propKeyStr(t, p))) propsIncluded++;
       });
     });
-    el.innerHTML = 'Будет включено: <b>'+typesIncluded+'</b> из '+all.length+' типов, <b>'+propsIncluded+'</b> из '+propsTotal+' свойств.';
+    el.innerHTML = 'Будет включено: <b>'+typesIncluded+'</b> из '+all.length+' типов и корневых свойств, <b>'+propsIncluded+'</b> из '+propsTotal+' свойств.';
   }
 
   // ---------- merge / XML generation ----------
-  // Порядок элементов в итоговом файле повторяет порядок файла A, новое из B идёт после.
-  function originalOrder(listA, listB){
-    const idx = new Map();
-    (listA||[]).forEach((x,i)=>{ if (!idx.has(x.name)) idx.set(x.name, i); });
-    (listB||[]).forEach((x,i)=>{ if (!idx.has(x.name)) idx.set(x.name, 1e6 + i); });
-    return function(items){
-      return items
-        .map((x,i)=>({ x, i, ord: idx.has(x.name) ? idx.get(x.name) : 2e6 }))
-        .sort((p,q)=> p.ord - q.ord || p.i - q.i)
-        .map(e=>e.x);
-    };
-  }
-
-  function buildMergedModel(){
-    const nsBase = state.pkgA.targetNamespace || state.pkgB.targetNamespace;
-    const imports = Array.from(new Set([...(state.pkgA.imports||[]), ...(state.pkgB.imports||[])]));
-
-    const valueTypes = [];
-    state.diffValueTypes.forEach(t=>{
-      const tk = typeKeyStr(t);
-      if (!getTypeInclude(tk)) return;
-      let chosen;
-      if (t.status === 'rm') chosen = t.a;
-      else if (t.status === 'add') chosen = t.b;
-      else if (t.status === 'same') chosen = t.a;
-      else { const side = getBaseSide(tk); chosen = side === 'A' ? t.a : t.b; }
-      if (chosen) valueTypes.push(chosen);
-    });
-
-    const objectTypes = [];
-    state.diffTypes.forEach(t=>{
-      const tk = typeKeyStr(t);
-      if (!getTypeInclude(tk)) return;
-
-      // Заголовок типа (base / open / sequenced и прочие атрибуты) берём целиком с одной стороны.
-      let head;
-      if (!t.a) head = t.b;
-      else if (!t.b) head = t.a;
-      else head = getBaseSide(tk) === 'A' ? t.a : t.b;
-
-      const properties = [];
-      t.props.forEach(p=>{
-        const pk = propKeyStr(tk, p.name);
-        if (!getPropInclude(pk)) return;
-        let chosen;
-        if (p.status === 'rm') chosen = p.a;
-        else if (p.status === 'add') chosen = p.b;
-        else if (p.status === 'same') chosen = p.a;
-        else { const side = getPropSide(pk); chosen = side === 'A' ? p.a : p.b; }
-        if (chosen) properties.push(chosen);
-      });
-
-      const orderProps = originalOrder(t.a ? t.a.properties : [], t.b ? t.b.properties : []);
-      objectTypes.push({
-        name: t.name, base: head.base, attrs: head.attrs, extraNodes: head.extraNodes,
-        properties: orderProps(properties), key: t.name
-      });
-    });
-
-    const rootAttrs = (state.pkgA.rootAttrs && state.pkgA.rootAttrs.length) ? state.pkgA.rootAttrs : state.pkgB.rootAttrs;
-
-    return {
-      targetNamespace: nsBase,
-      rootAttrs,
-      imports,
-      valueTypes: originalOrder(state.pkgA.valueTypes, state.pkgB.valueTypes)(valueTypes),
-      objectTypes: originalOrder(state.pkgA.objectTypes, state.pkgB.objectTypes)(objectTypes)
-    };
-  }
-
-  function escapeXml(s){
-    return String(s==null?'':s)
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-      .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
-  }
-
-  // Формат 1С (Package.bin): нет XML-декларации, отступы табами, переводы строк CRLF,
-  // префиксы пространств имён объявляются локально на каждом элементе как d<глубина>p<номер>.
-  const XS = 'http://www.w3.org/2001/XMLSchema';
-  const XDTO_NS = 'http://v8.1c.ru/8.1/xdto';
-
-  // Область видимости префиксов элемента: если пространство имён уже объявлено выше,
-  // используется тот же префикс, иначе объявляется новый вида d<глубина>p<номер>.
-  function nsScope(depth, parent){
-    const local = new Map();
-    let counter = 1;
-    const scope = {
-      lookup(uri){
-        if (local.has(uri)) return local.get(uri);
-        return parent ? parent.lookup(uri) : null;
-      },
-      ref(t){
-        if (!t) return null;
-        if (!t.uri) return t.local;
-        let prefix = scope.lookup(t.uri);
-        if (!prefix){
-          prefix = 'd'+depth+'p'+(counter++);
-          local.set(t.uri, prefix);
-        }
-        return prefix + ':' + t.local;
-      },
-      declarations(){
-        let s = '';
-        local.forEach((prefix, uri)=>{ s += ' xmlns:'+prefix+'="'+escapeXml(uri)+'"'; });
-        return s;
-      },
-      child(childDepth){ return nsScope(childDepth, scope); }
-    };
-    return scope;
-  }
-
-  // Базовая область видимости — объявления пространств имён с корневого элемента.
-  function rootScope(pkg){
-    const scope = nsScope(1, null);
-    const declared = new Map();
-    (pkg.rootAttrs || []).forEach(a=>{
-      if (a.name.indexOf('xmlns:') !== 0) return;
-      const prefix = a.name.slice(6);
-      if (!declared.has(a.value)) declared.set(a.value, prefix);
-    });
-    if (!declared.has(XS)) declared.set(XS, 'xs');
-    return {
-      lookup(uri){ return declared.get(uri) || null; },
-      child(depth){ return nsScope(depth, this); }
-    };
-  }
-
-  function rootAttrsString(pkg){
-    // Атрибуты корня переносим из исходного файла, targetNamespace берём из слияния.
-    const attrs = (pkg.rootAttrs || []).map(a=>({
-      name: a.name,
-      value: a.name === 'targetNamespace' ? pkg.targetNamespace : a.value
-    }));
-    const has = n => attrs.some(a=> a.name === n);
-    if (!has('xmlns')) attrs.unshift({ name: 'xmlns', value: XDTO_NS });
-    if (!has('xmlns:xs')) attrs.push({ name: 'xmlns:xs', value: XS });
-    if (!has('targetNamespace')) attrs.push({ name: 'targetNamespace', value: pkg.targetNamespace });
-    return attrs.map(a=> ' '+a.name+'="'+escapeXml(a.value)+'"').join('');
-  }
-
-  // Открывающий тег: сначала новые объявления префиксов, затем атрибуты в исходном порядке.
-  // qnameAttrs задаёт атрибуты-ссылки (base, type), значения которых пересобираются по префиксам.
-  function openTag(tag, rec, scope, qnameAttrs){
-    const refs = {};
-    Object.keys(qnameAttrs || {}).forEach(n=>{
-      if (qnameAttrs[n]) refs[n] = scope.ref(qnameAttrs[n]);
-    });
-    let s = '<' + tag + scope.declarations();
-    (rec.attrs || []).forEach(a=>{
-      const v = Object.prototype.hasOwnProperty.call(refs, a.name) ? refs[a.name] : a.value;
-      s += ' ' + a.name + '="' + escapeXml(v) + '"';
-    });
-    return s;
-  }
-
-  function generatePackage(pkg){
-    const root = rootScope(pkg);
-    const lines = [];
-    lines.push('<package'+rootAttrsString(pkg)+'>');
-
-    pkg.imports.forEach(ns=>{
-      lines.push('\t<import namespace="'+escapeXml(ns)+'"/>');
-    });
-
-    pkg.valueTypes.forEach(t=>{
-      if (!t) return;
-      const ns = root.child(2);
-      const head = openTag('valueType', t, ns, { base: t.base });
-      const extra = t.extraNodes || [];
-      if (extra.length === 0){
-        lines.push('\t'+head+'/>');
-        return;
-      }
-      lines.push('\t'+head+'>');
-      extra.forEach(x=> lines.push('\t\t'+x));
-      lines.push('\t</valueType>');
-    });
-
-    pkg.objectTypes.forEach(t=>{
-      if (!t) return;
-      const ns = root.child(2);
-      const head = openTag('objectType', t, ns, { base: t.base });
-      const extra = t.extraNodes || [];
-      if (t.properties.length === 0 && extra.length === 0){
-        lines.push('\t'+head+'/>');
-        return;
-      }
-      lines.push('\t'+head+'>');
-      t.properties.forEach(p=>{
-        const pns = ns.child(3);
-        lines.push('\t\t'+openTag('property', p, pns, { type: p.type })+'/>');
-      });
-      extra.forEach(x=> lines.push('\t\t'+x));
-      lines.push('\t</objectType>');
-    });
-
-    lines.push('</package>');
-    return lines.join('\r\n');
-  }
-
   function mergedFileName(){
     const src = (state.fileA && state.fileA.name) || (state.fileB && state.fileB.name) || 'Package.bin';
     return src;
   }
 
   function buildMergedXml(){
-    const model = buildMergedModel();
-    const xml = generatePackage(model);
+    const model = X.buildMergedModel(state.diff, state.ch);
+    const xml = X.generatePackage(model);
     const preview = document.getElementById('xml-preview');
     preview.value = xml;
     preview.classList.add('open');

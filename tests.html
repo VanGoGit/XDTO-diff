@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XDTO Diff — тесты</title>
+<style>
+  body{ background:#0e1015; color:#e7e9ee; font-family: ui-monospace, Consolas, monospace; font-size:13px; padding:20px; }
+  h1{ font-size:18px; font-family: system-ui, sans-serif; }
+  h2{ font-size:14px; margin-top:24px; }
+  .ok{ color:#34d399; } .fail{ color:#f87171; } .muted{ color:#8891a3; }
+  pre{ white-space:pre-wrap; margin:2px 0 8px 18px; color:#ffb4b4; }
+  p{ font-family: system-ui, sans-serif; color:#8891a3; max-width:80ch; }
+</style>
+</head>
+<body>
+<h1>XDTO Diff — тесты</h1>
+<p>Ядро загружается из <code>index.html</code> (блок <code>&lt;script id="xdto-core"&gt;</code>), поэтому страницу нужно открывать через http-сервер (например, <code>python -m http.server</code> в папке репозитория) или на GitHub Pages.</p>
+
+<h2>Синтетические пары A/B</h2>
+<div id="synthetic" class="muted">выполняется…</div>
+
+<h2>Реальные пакеты</h2>
+<p>Выберите папку <code>XDTOPackages</code> из выгрузки конфигурации. Для каждого пакета проверяется, что слияние пакета с самим собой даёт семантически тот же пакет (сравниваются разобранные модели с разрешёнными пространствами имён), а для соседних по имени пакетов — что «всё из A» и «всё из B» воспроизводят A и B. Файлы никуда не отправляются.</p>
+<input type="file" id="corpus" webkitdirectory multiple>
+<div id="corpus-result" class="muted"></div>
+
+<script>
+(async function(){
+  const out = document.getElementById('synthetic');
+  try{
+    const html = await (await fetch('index.html', { cache: 'no-store' })).text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const core = doc.getElementById('xdto-core');
+    if (!core) throw new Error('В index.html не найден <script id="xdto-core">');
+    (0, eval)(core.textContent);
+  } catch(e){
+    out.innerHTML = '<span class="fail">Не удалось загрузить ядро: ' + esc(e.message) + '</span>';
+    return;
+  }
+  const X = window.XDTOCore;
+
+  function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function assert(cond, msg){ if (!cond) throw new Error(msg); }
+
+  // ---------- helpers ----------
+  function typeOf(diff, kind, key){ return diff.items.find(t=> t.kind === kind && t.key === key); }
+  function propOf(t, key){ return t.props.find(p=> p.key === key); }
+
+  // Выбор «всё из side», как кнопка «Взять всё из A/B».
+  function choicesAll(diff, side){
+    const ch = X.newChoices();
+    ch.pkgSide = side;
+    diff.items.forEach(t=>{
+      const tk = X.typeKeyOf(t);
+      ch.typeInclude[tk] = side === 'A' ? !!t.a : !!t.b;
+      ch.headSide[tk] = side;
+      t.props.forEach(p=>{
+        const pk = X.propKeyOf(t, p);
+        ch.propInclude[pk] = side === 'A' ? !!p.a : !!p.b;
+        ch.propSide[pk] = side;
+      });
+    });
+    return ch;
+  }
+
+  function mergeAndReparse(diff, ch){
+    const xml = X.generatePackage(X.buildMergedModel(diff, ch));
+    return { xml, pkg: X.parsePackage(xml, 'результат') };
+  }
+
+  function itemCanon(pkg, kind, key){
+    const it = pkg.items.find(x=> x.kind === kind && x.key === key);
+    return it ? X.canonNode(it.node) : null;
+  }
+
+  // Набор типов без учёта порядка верхнего уровня (он не значим), плюс атрибуты пакета.
+  function itemsCanonSet(pkg){
+    return pkg.items.map(x=> X.canonNode(x.node)).sort().join('\n');
+  }
+  function rootAttrsCanon(pkg){
+    return pkg.attrs.map(a=> (a.ns ? '{'+a.ns+'}' : '') + a.local + '=' + a.value).sort().join(' ');
+  }
+
+  // ---------- synthetic ----------
+  const BASE = [
+    '<package xmlns="http://v8.1c.ru/8.1/xdto" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" targetNamespace="urn:t" elementFormQualified="true">',
+    '\t<import namespace="urn:other"/>',
+    '\t<property xmlns:d2p1="urn:t" name="Root" type="d2p1:Obj"/>',
+    '\t<valueType name="Code" base="xs:string" variety="Atomic" maxLength="3">',
+    '\t\t<enumeration xsi:type="xs:string">A</enumeration>',
+    '\t\t<enumeration xsi:type="xs:string">B</enumeration>',
+    '\t</valueType>',
+    '\t<valueType name="Codes" variety="List" itemType="xs:int"/>',
+    '\t<valueType xmlns:d2p1="urn:t" name="U" variety="Union" memberTypes="xs:string d2p1:Code"/>',
+    '\t<objectType name="Obj" sequenced="true">',
+    '\t\t<property xmlns:d3p1="urn:t" name="Kind" type="d3p1:Code" lowerBound="0" nillable="true"/>',
+    '\t\t<property name="Inline">',
+    '\t\t\t<typeDef xsi:type="ValueType" base="xs:string" variety="Atomic" maxLength="10">',
+    '\t\t\t\t<enumeration>x</enumeration>',
+    '\t\t\t</typeDef>',
+    '\t\t</property>',
+    '\t\t<property name="Nested">',
+    '\t\t\t<typeDef xsi:type="ObjectType">',
+    '\t\t\t\t<property xmlns:d5p1="urn:t" name="Inner" type="d5p1:Code"/>',
+    '\t\t\t</typeDef>',
+    '\t\t</property>',
+    '\t\t<property xmlns:d3p1="urn:other" ref="d3p1:ext"/>',
+    '\t\t<property xmlns:d3p1="urn:other" ref="d3p1:ext2"/>',
+    '\t\t<d3p1:property xmlns:d3p1="http://v8.1c.ru/8.1/xdto" name="attr" type="xs:string" form="Attribute" d3p1:qualified="false"/>',
+    '\t</objectType>',
+    '</package>'
+  ].join('\r\n');
+
+  function variant(pairs){
+    let s = BASE;
+    pairs.forEach(([from, to])=>{
+      assert(s.indexOf(from) !== -1, 'в базовом пакете нет фрагмента ' + from);
+      s = s.replace(from, to);
+    });
+    return s;
+  }
+
+  // target: [kind, typeKey] или [kind, typeKey, propKey]; expect — подстрока в пути отличия.
+  const CASES = [
+    { name: 'nillable свойства', b: [['nillable="true"', 'nillable="false"']], target: ['objectType','Obj','Kind'], expect: 'nillable' },
+    { name: 'lowerBound свойства', b: [['lowerBound="0" nillable', 'lowerBound="1" nillable']], target: ['objectType','Obj','Kind'], expect: 'lowerBound' },
+    { name: 'тип свойства (другое пространство имён при том же префиксе)', b: [['<property xmlns:d3p1="urn:t" name="Kind"', '<property xmlns:d3p1="urn:other" name="Kind"']], target: ['objectType','Obj','Kind'], expect: 'type' },
+    { name: 'enumeration в valueType', b: [['xs:string">B</enumeration>', 'xs:string">C</enumeration>']], target: ['valueType','Code'], expect: 'enumeration' },
+    { name: 'фасет maxLength в valueType', b: [['maxLength="3"', 'maxLength="4"']], target: ['valueType','Code'], expect: 'maxLength' },
+    { name: 'фасет во вложенном typeDef', b: [['maxLength="10"', 'maxLength="20"']], target: ['objectType','Obj','Inline'], expect: 'typeDef / maxLength' },
+    { name: 'enumeration во вложенном typeDef', b: [['<enumeration>x</enumeration>', '<enumeration>y</enumeration>']], target: ['objectType','Obj','Inline'], expect: 'enumeration' },
+    { name: 'свойство внутри анонимного ObjectType', b: [['name="Inner" type="d5p1:Code"', 'name="Inner" type="xs:string"']], target: ['objectType','Obj','Nested'], expect: 'property Inner / type' },
+    { name: 'корневое свойство', b: [['name="Root" type="d2p1:Obj"', 'name="Root" type="xs:string"']], target: ['property','Root'], expect: 'type' },
+    { name: 'itemType', b: [['itemType="xs:int"', 'itemType="xs:long"']], target: ['valueType','Codes'], expect: 'itemType' },
+    { name: 'memberTypes', b: [['memberTypes="xs:string d2p1:Code"', 'memberTypes="xs:int d2p1:Code"']], target: ['valueType','U'], expect: 'memberTypes' },
+    { name: 'xdto:qualified', b: [['d3p1:qualified="false"', 'd3p1:qualified="true"']], target: ['objectType','Obj','attr'], expect: 'xdto:qualified' },
+    { name: 'атрибут objectType', b: [['sequenced="true"', 'sequenced="false"']], target: ['objectType','Obj'], expect: 'sequenced' },
+    { name: 'порядок свойств', b: [['\t\t<property xmlns:d3p1="urn:other" ref="d3p1:ext"/>\r\n\t\t<property xmlns:d3p1="urn:other" ref="d3p1:ext2"/>', '\t\t<property xmlns:d3p1="urn:other" ref="d3p1:ext2"/>\r\n\t\t<property xmlns:d3p1="urn:other" ref="d3p1:ext"/>']], target: ['objectType','Obj'], expect: 'порядок свойств' },
+  ];
+
+  const results = [];
+  function run(name, fn){
+    try { fn(); results.push({ name, ok: true }); }
+    catch(e){ results.push({ name, ok: false, msg: e.stack || e.message }); }
+  }
+
+  run('базовый пакет: слияние с самим собой', ()=>{
+    const A = X.parsePackage(BASE, 'A');
+    assert(A.items.length === 5, 'ожидалось 5 элементов верхнего уровня, получено ' + A.items.length);
+    const obj = A.items.find(x=> x.key === 'Obj');
+    assert(obj.node.children.length === 6, 'у Obj ожидалось 6 свойств (включая два ref)');
+    const d = X.diffPackages(A, X.parsePackage(BASE, 'B'));
+    assert(d.items.every(t=> t.status === 'same'), 'есть отличия при сравнении с самим собой');
+    const r = mergeAndReparse(d, X.newChoices());
+    assert(X.canonPackage(r.pkg) === X.canonPackage(A), 'результат отличается от исходного:\n' + r.xml);
+    assert(r.xml.indexOf('xmlns="http://v8.1c.ru/8.1/xdto"', 10) === -1, 'дублируется xmlns на вложенных элементах');
+  });
+
+  run('только префиксы отличаются → совпадает', ()=>{
+    const B = variant([
+      ['<property xmlns:d3p1="urn:t" name="Kind" type="d3p1:Code"', '<property xmlns:zz="urn:t" name="Kind" type="zz:Code"'],
+      ['memberTypes="xs:string d2p1:Code"', 'memberTypes="{http://www.w3.org/2001/XMLSchema}string {urn:t}Code"'],
+      ['<d3p1:property xmlns:d3p1="http://v8.1c.ru/8.1/xdto" name="attr" type="xs:string" form="Attribute" d3p1:qualified="false"/>', '<property xmlns:q="http://v8.1c.ru/8.1/xdto" name="attr" type="xs:string" form="Attribute" q:qualified="false"/>'],
+    ]);
+    const d = X.diffPackages(X.parsePackage(BASE, 'A'), X.parsePackage(B, 'B'));
+    const bad = d.items.filter(t=> t.status !== 'same').map(t=> t.key);
+    assert(!bad.length, 'помечены изменёнными: ' + bad.join(', '));
+  });
+
+  CASES.forEach(c=>{
+    run(c.name, ()=>{
+      const A = X.parsePackage(BASE, 'A');
+      const B = X.parsePackage(variant(c.b), 'B');
+      const d = X.diffPackages(A, B);
+      const [kind, tkey, pkey] = c.target;
+      const t = typeOf(d, kind, tkey);
+      assert(t, 'тип не найден: ' + tkey);
+      assert(t.status === 'chg', 'статус типа ' + t.status + ', ожидался chg');
+      const others = d.items.filter(x=> x !== t && x.status !== 'same');
+      assert(!others.length, 'лишние отличия: ' + others.map(x=> x.key).join(', '));
+      let diffs, p;
+      if (pkey){
+        p = propOf(t, pkey);
+        assert(p && p.status === 'chg', 'свойство ' + pkey + ' не помечено изменённым');
+        diffs = p.diffs;
+      } else diffs = t.headDiffs;
+      assert(diffs.some(x=> x.path.indexOf(c.expect) !== -1), 'в описании отличий нет «' + c.expect + '»: ' + JSON.stringify(diffs));
+
+      // Перенос выбранной стороны: B → тип как в B, A → как в A.
+      ['A','B'].forEach(side=>{
+        const ch = X.newChoices();
+        const tk = X.typeKeyOf(t);
+        if (p) ch.propSide[X.propKeyOf(t, p)] = side; else ch.headSide[tk] = side;
+        const r = mergeAndReparse(d, ch);
+        const want = itemCanon(side === 'A' ? A : B, kind, tkey);
+        const got = itemCanon(r.pkg, kind, tkey);
+        assert(got === want, 'при выборе ' + side + ' результат не совпадает с ' + side + ':\n' + r.xml);
+      });
+    });
+  });
+
+  run('новое свойство из B встаёт после соседа', ()=>{
+    const B = variant([['\t\t<property name="Inline">', '\t\t<property name="New" type="xs:int"/>\r\n\t\t<property name="Inline">']]);
+    const d = X.diffPackages(X.parsePackage(BASE, 'A'), X.parsePackage(B, 'B'));
+    const r = mergeAndReparse(d, X.newChoices());
+    const obj = r.pkg.items.find(x=> x.key === 'Obj').node;
+    const names = obj.children.map(c=> (c.attrs.find(a=> a.local === 'name') || {}).value);
+    assert(names[1] === 'New', 'порядок: ' + names.join(', '));
+  });
+
+  run('пакеты без xmlns:xsi: typeDef из B получает объявление xsi', ()=>{
+    const A = '<package xmlns="http://v8.1c.ru/8.1/xdto" xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:t">\r\n\t<objectType name="O"/>\r\n</package>';
+    const d = X.diffPackages(X.parsePackage(A, 'A'), X.parsePackage(BASE, 'B'));
+    const r = mergeAndReparse(d, X.newChoices());
+    assert(itemCanon(r.pkg, 'objectType', 'Obj') === itemCanon(X.parsePackage(BASE, 'B'), 'objectType', 'Obj'), 'Obj из B перенесён с потерями:\n' + r.xml);
+  });
+
+  run('пространство имён — не URI (кириллица)', ()=>{
+    const A = '<package xmlns="http://v8.1c.ru/8.1/xdto" xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="ДопФайл">\r\n'
+      + '\t<property xmlns:d2p1="ДопФайл" name="Root" type="d2p1:O"/>\r\n\t<objectType name="O"/>\r\n</package>';
+    const pa = X.parsePackage(A, 'A');
+    const root = pa.items.find(x=> x.key === 'Root').node;
+    assert(root.attrs.find(a=> a.local === 'type').q.uri === 'ДопФайл', 'пространство имён разрешено неверно');
+    const B = A.replace('type="d2p1:O"', 'type="xs:string"');
+    const d = X.diffPackages(pa, X.parsePackage(B, 'B'));
+    assert(typeOf(d, 'property', 'Root').status === 'chg', 'отличие не найдено');
+    const r = mergeAndReparse(d, X.newChoices());
+    assert(X.canonPackage(r.pkg) === X.canonPackage(pa), 'результат отличается от A:\n' + r.xml);
+    assert(r.xml.indexOf('xmlns:d2p1="ДопФайл"') !== -1, 'в результате нет исходного пространства имён:\n' + r.xml);
+  });
+
+  out.innerHTML = renderResults(results);
+  window.syntheticResults = results;
+
+  // ---------- corpus ----------
+  function checkPackage(name, text){
+    const A = X.parsePackage(text, name);
+    const d = X.diffPackages(A, X.parsePackage(text, name));
+    const notSame = d.items.filter(t=> t.status !== 'same');
+    assert(!notSame.length, 'при сравнении с самим собой отличаются: ' + notSame.slice(0,5).map(t=> t.key).join(', '));
+    const r = mergeAndReparse(d, X.newChoices());
+    const ca = X.canonPackage(A), cr = X.canonPackage(r.pkg);
+    if (ca !== cr){
+      const la = ca.split('\n'), lr = cr.split('\n');
+      let i = 0; while (i < la.length && la[i] === lr[i]) i++;
+      throw new Error('слияние с самим собой изменило пакет, первое расхождение в элементе ' + i + ':\nA: ' + (la[i]||'').slice(0,600) + '\nR: ' + (lr[i]||'').slice(0,600));
+    }
+    const rb = mergeAndReparse(d, choicesAll(d, 'B'));
+    assert(X.canonPackage(rb.pkg) === ca, '«всё из B» при сравнении с самим собой изменило пакет');
+    return r.xml === text.replace(/\r?\n$/, '');
+  }
+
+  function checkPair(nameA, textA, nameB, textB){
+    const A = X.parsePackage(textA, nameA), B = X.parsePackage(textB, nameB);
+    const d = X.diffPackages(A, B);
+    [['A', A], ['B', B]].forEach(([side, src])=>{
+      const r = mergeAndReparse(d, choicesAll(d, side));
+      assert(rootAttrsCanon(r.pkg) === rootAttrsCanon(src), '«всё из ' + side + '»: атрибуты пакета не совпали');
+      if (itemsCanonSet(r.pkg) !== itemsCanonSet(src)){
+        const want = new Set(src.items.map(x=> X.canonNode(x.node)));
+        const bad = r.pkg.items.filter(x=> !want.has(X.canonNode(x.node))).map(x=> x.key);
+        throw new Error('«всё из ' + side + '» не воспроизвело ' + side + ': ' + bad.slice(0,5).join(', '));
+      }
+    });
+  }
+
+  window.runCorpus = function(files){
+    // files: [{ name, text }]
+    const t0 = performance.now();
+    const res = [];
+    let identical = 0;
+    files.forEach(f=>{
+      try { if (checkPackage(f.name, f.text)) identical++; res.push({ name: f.name, ok: true }); }
+      catch(e){ res.push({ name: f.name, ok: false, msg: e.message }); }
+    });
+    let pairs = 0;
+    const pairRes = [];
+    for (let i = 1; i < files.length; i++){
+      pairs++;
+      const a = files[i-1], b = files[i];
+      try { checkPair(a.name, a.text, b.name, b.text); pairRes.push({ name: a.name + ' ↔ ' + b.name, ok: true }); }
+      catch(e){ pairRes.push({ name: a.name + ' ↔ ' + b.name, ok: false, msg: e.message }); }
+    }
+    const ms = Math.round(performance.now() - t0);
+    const el = document.getElementById('corpus-result');
+    el.innerHTML = '<p>Слияние с самим собой:</p>' + renderResults(res, true)
+      + '<div class="muted">из них побайтно совпадают с исходным файлом: ' + identical + ' (для справки: отличия в префиксах и форматировании допустимы)</div>'
+      + '<p>Пары соседних пакетов («всё из A» / «всё из B»):</p>' + renderResults(pairRes, true)
+      + '<div class="muted">' + ms + ' мс</div>';
+    const summary = {
+      self: { total: res.length, failed: res.filter(r=> !r.ok), identical },
+      pairs: { total: pairRes.length, failed: pairRes.filter(r=> !r.ok) },
+      ms
+    };
+    window.corpusResults = summary;
+    return summary;
+  };
+
+  document.getElementById('corpus').addEventListener('change', async (e)=>{
+    const list = Array.from(e.target.files).filter(f=> /(^|\/)Package\.bin$/i.test(f.webkitRelativePath || f.name));
+    document.getElementById('corpus-result').textContent = 'читается ' + list.length + ' файлов…';
+    const files = await Promise.all(list.map(async f=>{
+      let text = await f.text();
+      if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+      return { name: (f.webkitRelativePath || f.name).split('/').slice(-3, -2)[0] || f.name, text };
+    }));
+    files.sort((x,y)=> x.name.localeCompare(y.name));
+    setTimeout(()=> window.runCorpus(files), 0);
+  });
+
+  function renderResults(list, onlyFailures){
+    const failed = list.filter(r=> !r.ok);
+    let html = '<div class="' + (failed.length ? 'fail' : 'ok') + '">' + (list.length - failed.length) + ' из ' + list.length + ' прошли</div>';
+    list.forEach(r=>{
+      if (onlyFailures && r.ok) return;
+      html += '<div class="' + (r.ok ? 'ok' : 'fail') + '">' + (r.ok ? '✓ ' : '✗ ') + esc(r.name) + '</div>';
+      if (!r.ok) html += '<pre>' + esc(r.msg) + '</pre>';
+    });
+    return html;
+  }
+})();
+</script>
+</body>
+</html>
